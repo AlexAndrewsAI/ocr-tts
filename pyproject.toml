@@ -1,0 +1,113 @@
+[project]
+name = "ocr-tts"
+version = "0.1.0"
+description = "OCR and TTS toolkit for screen region text extraction"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "AGPL-3.0"
+authors = [
+    {name = "AlexAndrewsAI", email = "alex.andrews.ai@protonmail.com"}
+]
+keywords = ["ocr", "tts", "tesseract", "screen-capture"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: GNU Affero General Public License v3",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+
+dependencies = [
+    "pydantic>=2.0",
+    "typer>=0.12.0",
+    "pytesseract>=0.3.10",
+    "Pillow>=10.0",
+    "mss>=9.0",
+    "numpy>=1.24.0",
+    "piper-tts>=1.6.0",
+    "fastapi>=0.141.1",
+    "uvicorn[standard]>=0.52.1",
+    "sounddevice>=0.5.5",
+    "dbus-fast>=5.0.22",
+    "pynput>=1.8.0",
+    "pyyaml>=6.0",
+]
+
+[dependency-groups]  # uv-specific feature for grouping optional dependencies
+dev = [
+    "pytest>=7.0",
+    "ruff",
+    "mypy",
+    "pytest-cov>=7.1.0",
+    "pip-audit",
+    "prek>=0.4.8",
+    "pymarkdownlnt",
+    "shellcheck-py>=0.11.0.1",
+    "httpx2>=2.9.1",
+]
+
+[project.scripts]
+ocr-tts = "ocr_tts.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/AlexAndrewsAI/ocr-tts"
+Repository = "https://github.com/AlexAndrewsAI/ocr-tts.git"
+Documentation = "https://github.com/AlexAndrewsAI/ocr-tts#readme"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes (undefined names, unused imports)
+    "W",   # pycodestyle warnings
+    "D",   # pydocstyle (docstring conventions)
+    "S",   # flake8-bandit (security checks)
+    "B",   # flake8-bugbear (common bugs)
+    "I",   # isort (import sorting)
+    "G",   # flake8-logging-format (logging format)
+    "C4",  # flake8-comprehensions (comprehension optimizations)
+    "PT",  # flake8-pytest-style (pytest conventions)
+    "UP",  # pyupgrade (modernize Python syntax)
+    "ARG", # flake8-unused-arguments (unused function arguments)
+    "RUF", # ruff-specific rules
+    "SIM", # flake8-simplify (code simplification)
+]
+ignore = ["D203", "D213"]  # Ignore conflicting docstring style rules (one-blank-line-before-class vs multi-line-summary)
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "PT019"]  # S101: asserts in tests; PT019: mock.patch injects params positionally
+
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true  # Warn when returning Any from a function
+warn_unused_configs = true  # Warn about unused mypy configuration
+disallow_untyped_defs = true  # Require type hints on all function definitions
+ignore_missing_imports = true  # Allow imports of packages without type stubs
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--cov=ocr_tts --cov-report=term-missing --cov-fail-under=75"
+
+[tool.coverage.run]
+source = ["ocr_tts"]
+omit = []
+parallel = true
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]

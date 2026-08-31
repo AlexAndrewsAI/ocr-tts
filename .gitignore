@@ -1,0 +1,113 @@
+# Project Specific
+*.wav
+
+REVIEW.md
+
+# General
+*.lock
+!uv.lock
+
+# Exclude all dot files/directories by default, then whitelist the ones we need.
+# There are too many possible .* files depending on which LLM agents and tools
+# you happen to use, so a whitelist approach is simpler and safer.
+/.*
+!.gitignore
+!.github
+!.env.example
+!.pre-commit-config.yaml
+!.pymarkdown.json
+
+# AI Agent Outputs & State Files
+agent_artifacts/
+agent_logs/
+agent_output/
+agent_memory/
+
+# AI Tool Cache & Config
+conversation_history/
+
+# Local Model Files
+*.bin
+*.gguf
+*.pth
+*.safetensors
+
+# Python
+*.egg
+*.egg-info/
+*.ipynb_checkpoints/
+*.py[cod]
+*.so
+*$py.class
+.eggs/
+.installed.cfg
+.pdm-python
+.Python
+__pycache__/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+lib/
+lib64/
+MANIFEST
+parts/
+pip-delete-this-directory.txt
+pip-log.txt
+pip-wheel-metadata/
+sdist/
+share/python-wheels/
+var/
+wheels/
+
+# Virtual Environments
+.venv/
+ENV/
+env/
+env.bak/
+venv/
+venv.bak/
+
+# Testing
+.coverage
+.coverage.*
+.hypothesis/
+.nox/
+.pytest_cache/
+.tox/
+htmlcov/
+
+# Type Checking
+.dmypy.json
+.mypy_cache/
+.pyre/
+.pytype/
+dmypy.json
+
+# Ruff
+.ruff_cache/
+
+# IDE & Editors
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+*~
+
+# Merge Conflicts
+*.orig
+*.rej
+
+# OS
+Thumbs.db
+
+# Project Specific
+*.db
+*.log
+*.sqlite
+*.sqlite3
+debug.log
+
+# Piper TTS voice models
+.piper-voices/
