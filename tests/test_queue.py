@@ -2,6 +2,7 @@
 
 import io
 import json
+import logging
 import signal
 import subprocess
 import sys
@@ -338,15 +339,15 @@ class TestCloseProcessHelpers:
     """Tests for the process discovery / termination helpers."""
 
     def test_find_api_pids_matches_module_and_port(self, tmp_path: Path) -> None:
-        """Only processes running ocr_tts.api on the matching port match."""
+        """Only processes running ocr_tts.api with the host/port pair match."""
         (tmp_path / "1234").mkdir()
         (tmp_path / "1234" / "cmdline").write_bytes(
-            b"python\x00-m\x00ocr_tts.api\x00--port\x008000\x00"
+            b"python\x00-m\x00ocr_tts.api\x00--host\x00127.0.0.1\x00--port\x008000\x00"
         )
         # Same module, different port -> excluded.
         (tmp_path / "5678").mkdir()
         (tmp_path / "5678" / "cmdline").write_bytes(
-            b"python\x00-m\x00ocr_tts.api\x00--port\x009000\x00"
+            b"python\x00-m\x00ocr_tts.api\x00--host\x00127.0.0.1\x00--port\x009000\x00"
         )
         # Same port, different module -> excluded.
         (tmp_path / "9999").mkdir()
@@ -357,7 +358,7 @@ class TestCloseProcessHelpers:
         (tmp_path / "notnum").mkdir()
 
         with patch("ocr_tts.queue.Path", return_value=tmp_path):
-            assert queue_module._find_api_pids(8000) == [1234]
+            assert queue_module._find_api_pids("127.0.0.1", 8000) == [1234]
 
     @patch("ocr_tts.queue.os.kill", side_effect=ProcessLookupError)
     def test_pid_exists_missing(self, mock_kill: MagicMock) -> None:
@@ -443,13 +444,36 @@ class TestCloseCLI:
         result = runner.invoke(cli_app, ["api", "close"])
         assert result.exit_code == 0
         mock_send.assert_called_once_with(host="127.0.0.1", port=8000)
-        mock_find.assert_called_once_with(8000)
+        mock_find.assert_called_once_with("127.0.0.1", 8000)
         mock_wait.assert_called_once()
         # No stragglers remain -> nothing is force-killed.
         assert mock_pid_exists.call_count == 2
         mock_terminate.assert_not_called()
         assert "Sent shutdown command" in result.output
         assert "TTS API server closed." in result.output
+
+    def test_close_logs_matched_pids(
+        self,
+        caplog: pytest.LogCaptureFixture,
+        runner: CliRunner,
+    ) -> None:
+        """Close logs the matched server PIDs before signalling (M6)."""
+        with (
+            patch(
+                "ocr_tts.queue.send_shutdown_request",
+                return_value={"status": "shutting_down"},
+            ),
+            patch(
+                "ocr_tts.queue._find_api_pids",
+                return_value=[1234, 5678],
+            ) as mock_find,
+            caplog.at_level(logging.INFO, logger="ocr_tts.queue"),
+        ):
+            result = runner.invoke(cli_app, ["api", "close"])
+        assert result.exit_code == 0
+        mock_find.assert_called_once_with("127.0.0.1", 8000)
+        assert "1234" in caplog.text
+        assert "5678" in caplog.text
 
     @patch(
         "ocr_tts.queue.send_shutdown_request",
@@ -472,7 +496,7 @@ class TestCloseCLI:
         result = runner.invoke(cli_app, ["api", "close", "--port", "9000"])
         assert result.exit_code == 0
         mock_send.assert_called_once_with(host="127.0.0.1", port=9000)
-        mock_find.assert_called_once_with(9000)
+        mock_find.assert_called_once_with("127.0.0.1", 9000)
         mock_wait.assert_called_once()
         assert mock_pid_exists.call_count == 1
         mock_terminate.assert_not_called()
@@ -511,7 +535,7 @@ class TestCloseCLI:
         result = runner.invoke(cli_app, ["api", "close"])
         assert result.exit_code == 0
         mock_send.assert_called_once_with(host="127.0.0.1", port=8000)
-        mock_find.assert_called_once_with(8000)
+        mock_find.assert_called_once_with("127.0.0.1", 8000)
         mock_wait.assert_called_once()
         assert mock_pid_exists.call_count == 1
         mock_terminate.assert_called_once_with(1234)
@@ -538,7 +562,7 @@ class TestCloseCLI:
         result = runner.invoke(cli_app, ["api", "close"])
         assert result.exit_code == 1
         mock_send.assert_called_once_with(host="127.0.0.1", port=8000)
-        mock_find.assert_called_once_with(8000)
+        mock_find.assert_called_once_with("127.0.0.1", 8000)
         mock_wait.assert_called_once()
         assert mock_pid_exists.call_count == 1
         mock_terminate.assert_called_once_with(1234)
@@ -613,3 +637,13 @@ class TestClearCLI:
         assert result.exit_code == 0
         mock_clear.assert_called_once_with(host="h", port=9000)
         assert "Queue cleared; 3 item(s) pending" in result.output
+
+    @patch("ocr_tts.queue.send_clear_request", return_value=None)
+    def test_clear_with_no_server_reports_already_cleared(
+        self, mock_clear: MagicMock, runner: CliRunner
+    ) -> None:
+        """`api clear` with no server running does not launch one (M5)."""
+        result = runner.invoke(cli_app, ["api", "clear"])
+        assert result.exit_code == 0
+        mock_clear.assert_called_once_with(host="127.0.0.1", port=8000)
+        assert "Queue is already cleared." in result.output

@@ -204,6 +204,12 @@ def create_default_config() -> HotkeyConfig:
 def run_ocr_region(item: HotkeyConfigItem) -> dict[str, Any]:
     """Run the interactive region-selection OCR workflow and queue the text.
 
+    Delegates to the same shared pipeline used by ``ocr-tts api send-region``
+    (:func:`ocr_tts.speak_region.capture_and_queue_region`) so the two
+    paths cannot drift apart.  All parameters (voice, speed, lang,
+    ``tesseract_cmd``, ``save_image``, host, port) are honored from the
+    hotkey config item.
+
     Args:
         item: Hotkey configuration providing voice/speed/lang/server settings.
 
@@ -211,33 +217,24 @@ def run_ocr_region(item: HotkeyConfigItem) -> dict[str, Any]:
         Result dictionary describing the outcome.
 
     """
-    from ocr_tts.ocr_region import (
-        capture_selected_region,
-        extract_text,
-        image_is_blank,
-        select_region,
-    )
-    from ocr_tts.text2speech import resolve_voice_alias
+    from ocr_tts.speak_region import capture_and_queue_region
 
     logger.info("Hotkey triggered: ocr-region (%s)", item.hotkey)
-    region = select_region()
-    if region.width == 0 or region.height == 0:
-        return {"status": "skipped", "reason": "no region selected"}
-    image = capture_selected_region(region)
-    if image_is_blank(image):
-        logger.warning("Captured region appears blank")
-    text = extract_text(image)
-    if not text:
-        return {"status": "error", "reason": "no text detected"}
-    response = send_speak_request(
-        text,
+    result = capture_and_queue_region(
+        voice=item.voice,
+        speed=item.speed,
         host=item.host,
         port=item.port,
-        voice=resolve_voice_alias(item.voice),
-        speed=item.speed,
+        lang=item.lang,
+        tesseract_cmd=item.tesseract_cmd,
+        save_image=item.save_image,
         verbose=False,
     )
-    return {"status": "ok", "queue_size": response.get("queue_size", 0)}
+    if result.status == "ok":
+        return {"status": "ok", "queue_size": result.queue_size}
+    if result.status == "skipped":
+        return {"status": "skipped", "reason": result.reason or "skipped"}
+    return {"status": "error", "reason": result.reason or "error"}
 
 
 def run_send_region(item: HotkeyConfigItem) -> dict[str, Any]:
@@ -328,8 +325,11 @@ def execute_action(item: HotkeyConfigItem) -> dict[str, Any]:
             return {"status": "ok", "queue_size": response.get("queue_size", 0)}
         if item.action is HotkeyAction.QUEUE_CLEAR:
             logger.info("Hotkey triggered: queue-clear (%s)", item.hotkey)
-            response = send_clear_request(host=item.host, port=item.port)
-            return {"status": "ok", "queue_size": response.get("queue_size", 0)}
+            clear_response = send_clear_request(host=item.host, port=item.port)
+            queue_size = (
+                clear_response.get("queue_size", 0) if clear_response is not None else 0
+            )
+            return {"status": "ok", "queue_size": queue_size}
         if item.action is HotkeyAction.SHUTDOWN:
             logger.info("Hotkey triggered: shutdown (%s)", item.hotkey)
             shutdown_response = send_shutdown_request(host=item.host, port=item.port)
@@ -386,22 +386,45 @@ _UI_ACTION_NAMES = frozenset(
 _ui_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="hotkey-ui")
 
 
+def _run_guarded(item: HotkeyConfigItem) -> None:
+    """Run an action in a worker thread, surfacing any exception.
+
+    ``execute_action`` re-raises ``SystemExit`` (from the queue client's
+    ``typer.Exit``) so callers that want to handle it can; but when run
+    on a worker thread an uncaught ``SystemExit``/``BaseException`` would
+    kill the thread with no user-visible error.  This guard logs it
+    instead so a failing hotkey action is never silent.
+
+    Args:
+        item: The hotkey binding to execute.
+
+    """
+    try:
+        execute_action(item)
+    except SystemExit as exc:
+        logger.error("Hotkey action %s aborted (exit code %s)", item.action, exc.code)
+    except BaseException:
+        logger.exception("Hotkey action %s failed", item.action)
+
+
 def dispatch_action(item: HotkeyConfigItem) -> None:
     """Run an action off the pynput listener thread.
 
     UI-bearing actions (region selection) are submitted to the shared
     single-thread executor; everything else runs on its own daemon
-    thread so slow network calls never block each other.
+    thread so slow network calls never block each other.  All worker
+    execution is wrapped in :func:`_run_guarded` so failures are logged
+    rather than silently terminating the thread.
 
     Args:
         item: The hotkey binding that was activated.
 
     """
     if item.action.value in _UI_ACTION_NAMES:
-        _ui_executor.submit(execute_action, item)
+        _ui_executor.submit(_run_guarded, item)
         return
     threading.Thread(
-        target=execute_action,
+        target=_run_guarded,
         args=(item,),
         name=f"hotkey-{item.action.value}",
         daemon=True,

@@ -90,6 +90,45 @@ class TestStreamingPlayerEdgeCases:
         assert isinstance(player._error, RuntimeError)
         assert "underrun" in str(player._error)
 
+    def test_stop_keeps_started_when_thread_alive(self) -> None:
+        """If stop() can't join a thread, the player stays marked as running."""
+        player = StreamingPlayer(MagicMock(), RecordingSink())
+        player._started = True
+        dead_beef = MagicMock()
+        dead_beef.is_alive.return_value = True
+        player._threads = [dead_beef]
+        player.stop()
+        # _started is still True, so the player isn't declared stopped
+        assert player._started is True
+        # The sink is not closed (which only happens when _started is set to False)
+        assert not player.sink.closed  # type: ignore[attr-defined]
+        # join was called with timeout
+        dead_beef.join.assert_called_once()
+
+    def test_start_refuses_when_old_thread_alive(self) -> None:
+        """If start() sees a still-alive thread from a previous run, it refuses."""
+        player = StreamingPlayer(MagicMock(), RecordingSink())
+        alive_thread = MagicMock()
+        alive_thread.is_alive.return_value = True
+        player._threads = [alive_thread]
+        player._started = False
+        with patch("ocr_tts.player.threading.Thread") as mock_thread_factory:
+            player.start()
+        # start() joined the straggler and refused to start
+        alive_thread.join.assert_called_once()
+        # _started is still False (player never started)
+        assert player._started is False
+        # No new threads were spawned
+        mock_thread_factory.assert_not_called()
+
+    def test_start_clears_previous_error(self) -> None:
+        """A previous error is cleared when a player is restarted."""
+        player = StreamingPlayer(MagicMock(), RecordingSink())
+        player._error = RuntimeError("old error")
+        player.start()
+        # _error is cleared at the start of start()
+        assert player._error is None
+
 
 class TestLiveCommand:
     """Tests for the live playback CLI command."""

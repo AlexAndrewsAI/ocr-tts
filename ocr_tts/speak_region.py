@@ -192,7 +192,9 @@ def speak_region(
         1.0,
         "--speed",
         "-s",
-        help="Speech speed multiplier (0.5-2.0)",
+        min=0.1,
+        max=3.0,
+        help="Speech speed multiplier (0.1-3.0, default: 1.0)",
     ),
     host: str = typer.Option(
         "127.0.0.1",

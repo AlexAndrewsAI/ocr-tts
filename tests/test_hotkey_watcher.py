@@ -90,7 +90,7 @@ class TestHotkeyConfig:
             hotkey="<ctrl>+<shift>+o",
             action=HotkeyAction.SEND_REGION,
             lang="deu",
-            tesseract_cmd="/usr/local/bin/tesseract",
+            tesseract_cmd="tesseract",
             save_image="region_capture.png",
         )
         path = write_config(tmp_path / "hotkeys.yaml", item)
@@ -255,10 +255,12 @@ class TestRunOcrRegion:
 
     def test_no_region_selected_is_skipped(self, speak_item: HotkeyConfigItem) -> None:
         """Empty region selection is reported as skipped."""
-        region = MagicMock(width=0, height=0)
         with (
             patch.object(hw, "__name__"),
-            patch("ocr_tts.ocr_region.select_region", return_value=region),
+            patch(
+                "ocr_tts.speak_region.select_region",
+                return_value=MagicMock(width=0, height=0),
+            ),
         ):
             result = hw.run_ocr_region(speak_item)
         assert result["status"] == "skipped"
@@ -268,10 +270,10 @@ class TestRunOcrRegion:
         region = MagicMock(width=10, height=10)
         image = MagicMock()
         with (
-            patch("ocr_tts.ocr_region.select_region", return_value=region),
-            patch("ocr_tts.ocr_region.capture_selected_region", return_value=image),
-            patch("ocr_tts.ocr_region.image_is_blank", return_value=False),
-            patch("ocr_tts.ocr_region.extract_text", return_value=""),
+            patch("ocr_tts.speak_region.select_region", return_value=region),
+            patch("ocr_tts.speak_region.capture_selected_region", return_value=image),
+            patch("ocr_tts.speak_region.image_is_blank", return_value=False),
+            patch("ocr_tts.speak_region.extract_text", return_value=""),
         ):
             result = hw.run_ocr_region(speak_item)
         assert result == {"status": "error", "reason": "no text detected"}
@@ -281,18 +283,59 @@ class TestRunOcrRegion:
         region = MagicMock(width=10, height=10)
         image = MagicMock()
         with (
-            patch("ocr_tts.ocr_region.select_region", return_value=region),
-            patch("ocr_tts.ocr_region.capture_selected_region", return_value=image),
-            patch("ocr_tts.ocr_region.image_is_blank", return_value=False),
-            patch("ocr_tts.ocr_region.extract_text", return_value="hello"),
+            patch("ocr_tts.speak_region.select_region", return_value=region),
+            patch("ocr_tts.speak_region.capture_selected_region", return_value=image),
+            patch("ocr_tts.speak_region.image_is_blank", return_value=False),
+            patch("ocr_tts.speak_region.extract_text", return_value="hello"),
             patch(
-                "ocr_tts.hotkey_watcher.send_speak_request",
+                "ocr_tts.speak_region.send_speak_request",
                 return_value={"queue_size": 2},
             ) as mock_send,
         ):
             result = hw.run_ocr_region(speak_item)
         assert result == {"status": "ok", "queue_size": 2}
         assert mock_send.call_args.args[0] == "hello"
+
+    def test_forwards_all_config_params(self, speak_item: HotkeyConfigItem) -> None:
+        """All configurable params reach capture_and_queue_region (M12)."""
+        item = speak_item.model_copy(
+            update={
+                "action": HotkeyAction.OCR_REGION,
+                "voice": "female",
+                "speed": 1.5,
+                "host": "localhost",
+                "port": 9000,
+                "lang": "fra",
+                "tesseract_cmd": "tesseract",
+                "save_image": "region_capture.png",
+            }
+        )
+        with (
+            patch("ocr_tts.speak_region.OCRConfig") as mock_config_cls,
+            patch(
+                "ocr_tts.speak_region.select_region",
+                return_value=MagicMock(width=10, height=10),
+            ),
+            patch(
+                "ocr_tts.speak_region.capture_selected_region",
+                return_value=MagicMock(),
+            ),
+            patch("ocr_tts.speak_region.image_is_blank", return_value=False),
+            patch("ocr_tts.speak_region.extract_text", return_value="bonjour"),
+            patch(
+                "ocr_tts.speak_region.send_speak_request",
+                return_value={"queue_size": 4},
+            ) as mock_send,
+        ):
+            result = hw.run_ocr_region(item)
+        assert result == {"status": "ok", "queue_size": 4}
+        mock_config_cls.assert_called_once_with(
+            lang="fra", tesseract_cmd="tesseract"
+        )
+        mock_send.assert_called_once()
+        assert mock_send.call_args.args[0] == "bonjour"
+        assert mock_send.call_args.kwargs["host"] == "localhost"
+        assert mock_send.call_args.kwargs["port"] == 9000
 
 
 class TestRunSendRegion:
@@ -308,7 +351,7 @@ class TestRunSendRegion:
                 "host": "localhost",
                 "port": 9000,
                 "lang": "fra",
-                "tesseract_cmd": "/usr/bin/tesseract",
+                "tesseract_cmd": "tesseract",
                 "save_image": "region_capture.png",
             }
         )
@@ -339,7 +382,7 @@ class TestRunSendRegion:
         assert mock_send.call_args.kwargs["host"] == "localhost"
         assert mock_send.call_args.kwargs["port"] == 9000
         mock_config_cls.assert_called_once_with(
-            lang="fra", tesseract_cmd="/usr/bin/tesseract"
+            lang="fra", tesseract_cmd="tesseract"
         )
         assert mock_extract.call_args.kwargs["config"] is mock_config_cls.return_value
 
@@ -441,11 +484,11 @@ class TestBuildCallbacks:
         item = HotkeyConfigItem(hotkey="<ctrl>+z", action=action)
         with (
             patch.object(hw, "_ui_executor") as mock_executor,
-            patch.object(hw, "execute_action") as mock_execute,
+            patch.object(hw, "_run_guarded") as mock_guarded,
         ):
             hw.dispatch_action(item)
             if action in (HotkeyAction.OCR_REGION, HotkeyAction.SEND_REGION):
-                mock_executor.submit.assert_called_once_with(mock_execute, item)
+                mock_executor.submit.assert_called_once_with(mock_guarded, item)
             else:
                 mock_executor.submit.assert_not_called()
 

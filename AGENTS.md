@@ -28,10 +28,12 @@
 ```text
 ocr_tts/
   __init__.py         (Package init)
+  _version.py         (Guarded import-time version resolution)
   __main__.py         (Module entry point)
   cli.py              (Typer CLI)
   ocr_region.py       (OCR region selection & extraction)
   desktop.py          (Platform services: screen capture backends + clipboard)
+  speak_region.py     (Shared region-capture + OCR + queue pipeline)
   text2speech.py      (Piper TTS engine + CLI)
   api.py              (FastAPI server: synthesize + queue endpoints)
   player.py           (Live streaming playback)

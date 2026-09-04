@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # ocr-region.sh
 # Send text to the running TTS API queue, mirroring what
-# `uv run ocr-tts api send-text` ("speak") and `api send-region` ("region")
-# do, but driving curl directly.
+# `ocr-tts api send-text` and `ocr-tts api send-region` do,
+# but driving curl directly.
 #
-# speak and region both POST to /queue with {"text","voice","speed"}; they
+# Both commands POST to /queue with {"text","voice","speed"}; they
 # differ only in where text comes from. For "region" pass the text that was
 # OCR'd from the screen selection.
 #

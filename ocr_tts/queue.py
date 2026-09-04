@@ -1,8 +1,8 @@
 """Remote control for the running TTS server queue.
 
-Provides a Typer client for the ``tts-api`` server: ``speak`` appends
-text to the server's processing queue (each item carrying its own voice
-and speed), and ``clear`` wipes the queue and immediately stops playback.
+Provides a Typer client for the OCR-TTS API server: ``ocr-tts api send-text``
+appends text to the server's processing queue (each item carrying its own voice
+and speed), and ``ocr-tts api clear`` wipes the queue and immediately stops playback.
 
 The queue lives on the server, so the client is intentionally stateless:
 it simply forwards the requested text/voice/speed to the running server
@@ -10,17 +10,18 @@ and reports the server's response.
 
 Typical usage::
 
-    speak "Hello world"
-    speak "Bonjour!" -v fr_FR-siwis-medium -s 1.2
-    clear
-    close
+    ocr-tts api send-text "Hello world"
+    ocr-tts api send-text "Bonjour!" --voice fr_FR-siwis-medium --speed 1.2
+    ocr-tts api clear
+    ocr-tts api close
 
-When the server is not running and a connection is refused, ``speak``
-and ``clear`` log a warning, launch ``tts-api`` in the background, and
-retry the request once.  A second connection-refused error is treated as
-a hard failure.  ``close`` asks the running server to tear itself down
-via its ``/shutdown`` endpoint (and force-terminates it as a safety net
-if it does not exit).
+When the server is not running and a connection is refused, ``send-text``
+logs a warning, launches the API server in the background, and retries the
+request once.  A second connection-refused error is treated as a hard
+failure.  ``clear`` never auto-launches: clearing an empty queue on a
+server that is not running is a no-op.  ``close`` asks the running
+server to tear itself down via its ``/shutdown`` endpoint (and
+force-terminates it as a safety net if it does not exit).
 """
 
 from __future__ import annotations
@@ -120,7 +121,10 @@ def _parse_host_port(url: str) -> tuple[str, int]:
 
     """
     parsed = urlparse(url)
-    return parsed.hostname or _DEFAULT_HOST, parsed.port or _DEFAULT_PORT
+    return (
+        parsed.hostname or _DEFAULT_HOST,
+        parsed.port if parsed.port is not None else _DEFAULT_PORT,
+    )
 
 
 def _wait_for_server(host: str, port: int, timeout: float = 10.0) -> bool:
@@ -146,7 +150,7 @@ def _wait_for_server(host: str, port: int, timeout: float = 10.0) -> bool:
 
 
 def _launch_server(host: str, port: int) -> subprocess.Popen[bytes] | None:
-    """Start ``tts-api`` as a background subprocess.
+    """Start the OCR-TTS API server as a background subprocess.
 
     Args:
         host: Bind address for the new server.
@@ -181,9 +185,10 @@ def _post_json(url: str, payload: dict[str, object]) -> dict[str, object]:
     """POST a JSON payload to a URL and return the parsed response.
 
     If the server cannot be reached because the connection is refused,
-    the function logs a warning, launches ``tts-api`` in the background,
-    waits for it to become ready, and retries the request exactly once.
-    A second connection-refused error raises ``typer.Exit`` with code 1.
+    the function logs a warning, launches the OCR-TTS API server in the
+    background, waits for it to become ready, and retries the request
+    exactly once.  A second connection-refused error raises ``typer.Exit``
+    with code 1.
 
     Args:
         url: Full endpoint URL.
@@ -226,7 +231,7 @@ def _post_json(url: str, payload: dict[str, object]) -> dict[str, object]:
                 )
                 typer.echo(
                     f"Cannot reach TTS server at {url}: {exc.reason}. "
-                    "Attempting to launch tts-api in the background...",
+                    "Attempting to launch the OCR-TTS API server in the background...",
                     err=True,
                 )
                 proc = _launch_server(host, port)
@@ -292,18 +297,47 @@ def send_speak_request(
 def send_clear_request(
     host: str = _DEFAULT_HOST,
     port: int = _DEFAULT_PORT,
-) -> dict[str, object]:
+) -> dict[str, object] | None:
     """Ask the server to wipe the queue and stop playback immediately.
+
+    POSTs to the server's ``/queue/clear`` endpoint.  Unlike
+    :func:`_post_json`, this never auto-launches a brand-new server when
+    the connection is refused: clearing an empty queue on a server that
+    is not running is a no-op, not a reason to start one.
 
     Args:
         host: TTS server host.
         port: TTS server port.
 
     Returns:
-        The server's JSON response.
+        The server's JSON response, or ``None`` when no server is running
+        (the connection was refused).
+
+    Raises:
+        typer.Exit: If the server returns an error or cannot otherwise be
+            reached.
 
     """
-    return _post_json(_server_url(host, port, f"{_QUEUE_PATH}/clear"), {})
+    url = _server_url(host, port, f"{_QUEUE_PATH}/clear")
+    request = urllib.request.Request(  # noqa: S310
+        url,
+        data=b"{}",
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:  # noqa: S310
+            return cast(dict[str, object], json.loads(response.read().decode("utf-8")))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        typer.echo(f"Server error ({exc.code}): {body}", err=True)
+        raise typer.Exit(code=1) from None
+    except urllib.error.URLError as exc:
+        if _is_connection_refused(exc):
+            logger.info("TTS server not running; queue is already cleared")
+            return None
+        typer.echo(f"Cannot reach TTS server at {url}: {exc.reason}", err=True)
+        raise typer.Exit(code=1) from None
 
 
 def send_shutdown_request(
@@ -358,15 +392,44 @@ def send_shutdown_request(
 _CLOSE_TIMEOUT_S = 5.0
 
 
-def _find_api_pids(port: int) -> list[int]:
-    """Locate the PIDs of running TTS API server processes on ``port``.
+def _has_exact_pair(tokens: list[bytes], flag: bytes, value: bytes) -> bool:
+    """Return True when *tokens* hold ``flag`` immediately followed by *value*.
 
-    The queue client launches the server as a detached background
-    subprocess (``python -m ocr_tts.api --port <port>``), so running
-    servers are located by scanning ``/proc`` for a command line that
-    runs the ``ocr_tts.api`` module on the requested port.
+    The server is spawned as ``python -m ocr_tts.api --host <host>
+    --port <port>``, so its null-separated command line contains
+    ``--host``/``--port`` followed by the value as the very next token.
+    Matching the exact adjacent token pair (rather than a substring)
+    avoids mistaking ``8000`` for a port in ``18000`` or an unrelated
+    numeric argument.
 
     Args:
+        tokens: Null-separated command-line tokens.
+        flag: The flag token to locate (e.g. ``b"--port"``).
+        value: The exact value token that must follow *flag*.
+
+    Returns:
+        True if the adjacent ``flag``/``value`` pair appears in *tokens*.
+
+    """
+    for index, token in enumerate(tokens):
+        if token == flag and index + 1 < len(tokens) and tokens[index + 1] == value:
+            return True
+    return False
+
+
+def _find_api_pids(host: str, port: int) -> list[int]:
+    """Locate the PIDs of running TTS API server processes.
+
+    The queue client launches the server as a detached background
+    subprocess (``python -m ocr_tts.api --host <host> --port <port>``),
+    so running servers are located by scanning ``/proc`` for a command
+    line that runs the ``ocr_tts.api`` module with the exact ``--host``
+    and ``--port`` argument pair.  Matching the exact pair (rather than a
+    substring) prevents targeting an unrelated process that merely
+    mentions the port digits, e.g. ``--port 18000`` when seeking ``8000``.
+
+    Args:
+        host: The server host to match.
         port: The server port to match.
 
     Returns:
@@ -374,11 +437,12 @@ def _find_api_pids(port: int) -> list[int]:
 
     """
     pids: list[int] = []
+    host_token = str(host).encode()
+    port_token = str(port).encode()
     try:
         proc_dirs = list(Path("/proc").iterdir())
     except OSError:
         return pids
-    port_token = str(port).encode()
     for proc_dir in proc_dirs:
         if not proc_dir.name.isdigit():
             continue
@@ -386,8 +450,14 @@ def _find_api_pids(port: int) -> list[int]:
             cmdline = (proc_dir / "cmdline").read_bytes()
         except OSError:
             continue
-        if b"ocr_tts.api" in cmdline and port_token in cmdline:
-            pids.append(int(proc_dir.name))
+        tokens = cmdline.split(b"\0")
+        if b"ocr_tts.api" not in tokens:
+            continue
+        if not _has_exact_pair(tokens, b"--host", host_token):
+            continue
+        if not _has_exact_pair(tokens, b"--port", port_token):
+            continue
+        pids.append(int(proc_dir.name))
     return sorted(pids)
 
 
@@ -513,8 +583,12 @@ def close(
         err=True,
     )
     # Give the server a chance to tear itself down gracefully, then
-    # force-terminate any process that did not exit on its own.
-    pids = _find_api_pids(port)
+    # force-terminate any process that did not exit on its own.  Servers
+    # are identified by the exact host/port pair the client would have
+    # launched, so only the intended server is considered.
+    pids = _find_api_pids(host, port)
+    if pids:
+        logger.info("Found TTS API server process(es) for %s:%s: %s", host, port, pids)
     _wait_for_pids_gone(pids)
     stragglers = [pid for pid in pids if _pid_exists(pid)]
     for pid in stragglers:
@@ -545,8 +619,9 @@ def clear(
 
     Sends a ``POST /queue/clear`` request to the running server, which
     drains all pending text and audio and stops playback of any in-flight
-    item.  Like ``speak``, this auto-launches the server in the background
-    when one is not already running.
+    item.  When no server is running the queue is trivially empty, so
+    ``clear`` reports that rather than auto-launching a brand-new server
+    (unlike ``ocr-tts api send-text``).
 
     Args:
         host: TTS server host.
@@ -554,6 +629,13 @@ def clear(
 
     """
     response = send_clear_request(host=host, port=port)
+    if response is None:
+        typer.echo(
+            f"No running TTS API server found on port {port} "
+            f"(host {host}). Queue is already cleared.",
+            err=True,
+        )
+        return
     typer.echo(
         f"Queue cleared; {response.get('queue_size', 0)} item(s) pending",
         err=True,

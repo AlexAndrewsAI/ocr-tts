@@ -30,14 +30,16 @@ differs from the logical screen (e.g. gamescope Game Mode).
 """
 
 import logging
+import threading
 import time
 from collections.abc import Callable
 from typing import Any, NamedTuple
 
 import pytesseract
-import typer
 from PIL import Image
 from pydantic import BaseModel, Field
+
+import shutil
 
 from ocr_tts.desktop import (
     _primary_monitor,
@@ -83,6 +85,13 @@ class OCRConfig(BaseModel):
     lang: str = Field(default="eng", description="OCR language code")
 
     model_config = {"title": "OCR Config", "frozen": True}
+
+
+# pytesseract mutates a module-level global (``pytesseract.pytesseract.tesseract_cmd``)
+# when setting the path to the tesseract binary.  Two concurrent OCR calls
+# with different ``tesseract_cmd`` values would race.  This lock serialises
+# the set-and-call sequence so that concurrent callers never cross.
+_tesseract_lock = threading.Lock()
 
 
 def _capture_background(monitor: dict[str, int]) -> Image.Image | None:
@@ -430,63 +439,17 @@ def extract_text(image: Image.Image, config: OCRConfig | None = None) -> str:
     if config is None:
         config = OCRConfig()
 
-    pytesseract.pytesseract.tesseract_cmd = config.tesseract_cmd
-    raw_text: object = pytesseract.image_to_string(image, lang=config.lang)
+    tesseract_path = shutil.which(config.tesseract_cmd)
+    if tesseract_path is None:
+        raise RuntimeError(
+            f"tesseract executable '{config.tesseract_cmd}' not found on PATH. "
+            "Install Tesseract (e.g., apt install tesseract-ocr, brew install tesseract) "
+            "or specify the correct binary with --tesseract-cmd."
+        )
+
+    with _tesseract_lock:
+        pytesseract.pytesseract.tesseract_cmd = config.tesseract_cmd
+        raw_text: object = pytesseract.image_to_string(image, lang=config.lang)
     text = str(raw_text)
     logger.info("Extracted %d characters via OCR", len(text))
     return text.strip()
-
-
-def ocr_region_command(
-    lang: str = typer.Option(
-        "eng",
-        "--lang",
-        "-l",
-        help="OCR language code (e.g., eng, fra, deu, spa)",
-    ),
-    tesseract_cmd: str = typer.Option(
-        "tesseract",
-        "--tesseract-cmd",
-        help="Path to the tesseract executable",
-    ),
-    save_image: str | None = typer.Option(
-        None,
-        "--save-image",
-        help="Save the captured region to this image file for inspection",
-    ),
-) -> None:
-    """Select a screen region and extract text via OCR.
-
-    A transparent overlay will appear. Click and drag to
-    select the region you want to extract text from.
-    """
-    config = OCRConfig(lang=lang, tesseract_cmd=tesseract_cmd)
-
-    typer.echo("Click and drag to select a screen region...", err=True)
-    region = select_region()
-    logger.info("Selected region: %s", region)
-
-    if region.width == 0 or region.height == 0:
-        typer.echo("No region selected. Exiting.", err=True)
-        raise typer.Exit(code=0)
-
-    typer.echo(
-        f"Capturing region ({region.x}, {region.y}, {region.width}x{region.height})...",
-        err=True,
-    )
-    image = capture_selected_region(region)
-    if save_image is not None:
-        image.save(save_image)
-        typer.echo(f"Saved captured region to {save_image}", err=True)
-    if image_is_blank(image):
-        typer.echo(
-            "Warning: captured region appears blank; screen capture may "
-            "have failed on this display server.",
-            err=True,
-        )
-    text = extract_text(image, config=config)
-
-    if text:
-        typer.echo(text)
-    else:
-        typer.echo("(no text detected)", err=True)

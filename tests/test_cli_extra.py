@@ -4,13 +4,11 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
-import pytest
-import typer
 from PIL import Image
 from typer.testing import CliRunner
 
 from ocr_tts.cli import app
-from ocr_tts.ocr_region import Region, ocr_region_command, select_region
+from ocr_tts.ocr_region import Region, select_region
 
 
 def _textured_image() -> Image.Image:
@@ -74,58 +72,67 @@ class TestCliLaunch:
         assert result.exit_code == 0
         serve.assert_called_once_with(host="127.0.0.1", port=8123)
 
+    def test_launch_defaults_to_loopback(self, runner: CliRunner) -> None:
+        """Api launch binds loopback by default (M1, no LAN exposure)."""
+        with patch("ocr_tts.cli._api_serve") as serve:
+            result = runner.invoke(app, ["api", "launch"])
+        assert result.exit_code == 0
+        serve.assert_called_once_with(host="127.0.0.1", port=8000)
+
 
 class TestOcrRegionCommand:
-    """Tests for the standalone ocr_region command function."""
+    """Tests for the canonical ``ocr`` CLI command (single implementation)."""
 
-    def test_full_success_with_save(self, tmp_path: Path) -> None:
+    def test_full_success_with_save(self, runner: CliRunner, tmp_path: Path) -> None:
         """A successful run prints extracted text and saves the capture."""
         save_path = tmp_path / "cap.png"
         with (
             patch(
-                "ocr_tts.ocr_region.select_region",
+                "ocr_tts.cli.select_region",
                 return_value=Region(x=1, y=2, width=30, height=40),
             ),
             patch(
-                "ocr_tts.ocr_region.capture_selected_region",
+                "ocr_tts.cli.capture_selected_region",
                 return_value=_textured_image(),
             ) as capture,
-            patch("ocr_tts.ocr_region.image_is_blank", return_value=False),
-            patch("ocr_tts.ocr_region.extract_text", return_value="standalone text"),
+            patch("ocr_tts.cli.image_is_blank", return_value=False),
+            patch("ocr_tts.cli.extract_text", return_value="standalone text"),
         ):
-            ocr_region_command(
-                lang="eng", tesseract_cmd="tesseract", save_image=str(save_path)
-            )
+            result = runner.invoke(app, ["ocr", "--save-image", str(save_path)])
+        assert result.exit_code == 0
+        assert "standalone text" in result.output
         assert save_path.exists()
         capture.assert_called_once()
 
-    def test_no_region_selected_exits(self) -> None:
+    def test_no_region_selected_exits(self, runner: CliRunner) -> None:
         """An empty region exits cleanly with a note."""
         with (
             patch(
-                "ocr_tts.ocr_region.select_region",
+                "ocr_tts.cli.select_region",
                 return_value=Region(x=0, y=0, width=0, height=0),
             ),
-            pytest.raises(typer.Exit) as exc_info,
         ):
-            ocr_region_command(lang="eng", tesseract_cmd="tesseract", save_image=None)
-        assert exc_info.value.exit_code == 0
+            result = runner.invoke(app, ["ocr"])
+        assert result.exit_code == 0
+        assert "No region selected" in result.output
 
-    def test_no_text_detected(self) -> None:
+    def test_no_text_detected(self, runner: CliRunner) -> None:
         """No OCR text reports the fallback message."""
         with (
             patch(
-                "ocr_tts.ocr_region.select_region",
+                "ocr_tts.cli.select_region",
                 return_value=Region(x=0, y=0, width=10, height=10),
             ),
             patch(
-                "ocr_tts.ocr_region.capture_selected_region",
+                "ocr_tts.cli.capture_selected_region",
                 return_value=_textured_image(),
             ),
-            patch("ocr_tts.ocr_region.image_is_blank", return_value=False),
-            patch("ocr_tts.ocr_region.extract_text", return_value=""),
+            patch("ocr_tts.cli.image_is_blank", return_value=False),
+            patch("ocr_tts.cli.extract_text", return_value=""),
         ):
-            ocr_region_command(lang="eng", tesseract_cmd="tesseract", save_image=None)
+            result = runner.invoke(app, ["ocr"])
+        assert result.exit_code == 0
+        assert "no text detected" in result.output
 
 
 class TestSelectRegionOnHandoff:
@@ -175,23 +182,25 @@ class TestSelectRegionOnHandoff:
 
 
 class TestOcrRegionCommandBlankWarning:
-    """Ensure the standalone command warns on blank captures."""
+    """Ensure the canonical ``ocr`` CLI warns on blank captures."""
 
-    def test_blank_capture_warns(self) -> None:
+    def test_blank_capture_warns(self, runner: CliRunner) -> None:
         """A blank capture prints the display-server warning."""
         with (
             patch(
-                "ocr_tts.ocr_region.select_region",
+                "ocr_tts.cli.select_region",
                 return_value=Region(x=0, y=0, width=10, height=10),
             ),
             patch(
-                "ocr_tts.ocr_region.capture_selected_region",
+                "ocr_tts.cli.capture_selected_region",
                 return_value=_textured_image(),
             ),
-            patch("ocr_tts.ocr_region.image_is_blank", return_value=True),
-            patch("ocr_tts.ocr_region.extract_text", return_value="words"),
+            patch("ocr_tts.cli.image_is_blank", return_value=True),
+            patch("ocr_tts.cli.extract_text", return_value="words"),
         ):
-            ocr_region_command(lang="eng", tesseract_cmd="tesseract", save_image=None)
+            result = runner.invoke(app, ["ocr"])
+        assert result.exit_code == 0
+        assert "appears blank" in result.output
 
 
 class TestCaptureBackgroundOuterFailure:

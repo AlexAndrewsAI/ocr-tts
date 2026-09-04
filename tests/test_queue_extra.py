@@ -1,6 +1,7 @@
 """Additional coverage tests for the queue client and its helpers."""
 
 import errno
+import sys
 import urllib.error
 from unittest.mock import MagicMock, patch
 
@@ -75,6 +76,28 @@ class TestLaunchServer:
         ):
             assert _launch_server("127.0.0.1", 9999) is None
 
+    @patch("ocr_tts.queue.subprocess.Popen")
+    def test_spawns_server_with_requested_host_and_port(
+        self, mock_popen: MagicMock
+    ) -> None:
+        """The spawned server argv carries the requested host and port.
+
+        This is the argv the ``python -m ocr_tts.api`` entry point parses,
+        so the two must stay in sync (custom ports must not be dropped).
+        """
+        mock_popen.return_value = MagicMock()
+        _launch_server("127.0.0.1", 9000)
+        argv = mock_popen.call_args.args[0]
+        assert argv == [
+            sys.executable,
+            "-m",
+            "ocr_tts.api",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "9000",
+        ]
+
 
 class TestPostJsonRelaunchFailure:
     """Tests for the relaunch fallback in _post_json."""
@@ -97,7 +120,7 @@ class TestPostJsonRelaunchFailure:
 
 
 class TestFindApiPids:
-    """Tests for /proc-based server process discovery."""
+    """Tests for /proc-based server process discovery (M6/M7)."""
 
     @staticmethod
     def _proc_dir(name: str, cmdline: bytes | Exception) -> MagicMock:
@@ -114,18 +137,20 @@ class TestFindApiPids:
         path_cls = MagicMock()
         path_cls.return_value.iterdir.side_effect = OSError("no /proc")
         with patch("ocr_tts.queue.Path", path_cls):
-            assert _find_api_pids(8000) == []
+            assert _find_api_pids("127.0.0.1", 8000) == []
 
     def test_unreadable_cmdline_is_skipped(self) -> None:
         """Entries whose cmdline cannot be read are skipped."""
-        good = self._proc_dir("123", b"python\0-m\0ocr_tts.api\0--port\08000\0")
+        good = self._proc_dir(
+            "123", b"python\0-m\0ocr_tts.api\x00--host\x00127.0.0.1\0--port\08000\0"
+        )
         bad = self._proc_dir("456", OSError("vanished"))
         non_numeric = MagicMock()
         non_numeric.name = "self"
         path_cls = MagicMock()
         path_cls.return_value.iterdir.return_value = [good, bad, non_numeric]
         with patch("ocr_tts.queue.Path", path_cls):
-            assert _find_api_pids(8000) == [123]
+            assert _find_api_pids("127.0.0.1", 8000) == [123]
 
     def test_no_match_yields_empty(self) -> None:
         """Processes without matching cmdlines are ignored."""
@@ -133,7 +158,42 @@ class TestFindApiPids:
         path_cls = MagicMock()
         path_cls.return_value.iterdir.return_value = [other]
         with patch("ocr_tts.queue.Path", path_cls):
-            assert _find_api_pids(8000) == []
+            assert _find_api_pids("127.0.0.1", 8000) == []
+
+    def test_port_substring_is_not_matched(self) -> None:
+        """Port 18000 must not match a search for port 8000 (M6)."""
+        wrong_port = self._proc_dir(
+            "123", b"python\0-m\0ocr_tts.api\x00--host\x00127.0.0.1\0--port\018000\0"
+        )
+        path_cls = MagicMock()
+        path_cls.return_value.iterdir.return_value = [wrong_port]
+        with patch("ocr_tts.queue.Path", path_cls):
+            assert _find_api_pids("127.0.0.1", 8000) == []
+
+    def test_host_mismatch_is_not_matched(self) -> None:
+        """A different --host is not matched (M7)."""
+        other_host = self._proc_dir(
+            "123", b"python\0-m\0ocr_tts.api\x00--host\x000.0.0.0\0--port\08000\0"
+        )
+        path_cls = MagicMock()
+        path_cls.return_value.iterdir.return_value = [other_host]
+        with patch("ocr_tts.queue.Path", path_cls):
+            assert _find_api_pids("127.0.0.1", 8000) == []
+
+    def test_multiple_sorted_pids(self) -> None:
+        """All matching servers are returned in sorted order."""
+        ent = []
+        for name in ("30", "10", "20"):
+            ent.append(
+                self._proc_dir(
+                    name,
+                    b"python\0-m\0ocr_tts.api\x00--host\x00127.0.0.1\0--port\08000\0",
+                )
+            )
+        path_cls = MagicMock()
+        path_cls.return_value.iterdir.return_value = ent
+        with patch("ocr_tts.queue.Path", path_cls):
+            assert _find_api_pids("127.0.0.1", 8000) == [10, 20, 30]
 
 
 class TestSignalPid:
@@ -205,16 +265,73 @@ class TestSpeakVersionShortCircuit:
         speak(text="hi", version=True)
 
 
+class TestVersionResolution:
+    """Tests for guarded import-time version resolution (M9)."""
+
+    def test_falls_back_when_distribution_missing(self) -> None:
+        """A missing distribution yields the default version, not a crash."""
+        import importlib
+
+        import ocr_tts._version as version_mod
+
+        with patch(
+            "importlib.metadata.version",
+            side_effect=importlib.metadata.PackageNotFoundError("no dist"),
+        ):
+            reloaded = importlib.reload(version_mod)
+        assert reloaded.__version__ == "0.1.0"
+
+    def test_uses_distribution_version_when_available(self) -> None:
+        """An installed distribution supplies the real metadata version."""
+        import importlib
+
+        import ocr_tts._version as version_mod
+
+        with patch("importlib.metadata.version", return_value="9.9.9"):
+            reloaded = importlib.reload(version_mod)
+        assert reloaded.__version__ == "9.9.9"
+
+
 class TestSendClearRequest:
-    """Tests for the queue-clear client helper."""
+    """Tests for the queue-clear client helper (M5)."""
 
     def test_posts_to_clear_endpoint(self) -> None:
         """The helper posts an empty payload to /queue/clear."""
         from ocr_tts.queue import send_clear_request
 
-        with patch(
-            "ocr_tts.queue._post_json", return_value={"status": "cleared"}
-        ) as post:
+        mock_response = MagicMock()
+        mock_response.read.return_value = b'{"status": "cleared", "queue_size": 0}'
+        with patch("urllib.request.urlopen") as urlopen:
+            urlopen.return_value.__enter__.return_value = mock_response
             result = send_clear_request(host="h", port=1)
-        assert result == {"status": "cleared"}
-        assert post.call_args[0][0].endswith("/queue/clear")
+
+        assert result == {"status": "cleared", "queue_size": 0}
+        request = urlopen.call_args.args[0]
+        assert request.full_url.endswith("/queue/clear")
+
+    def test_connection_refused_returns_none_without_launching(self) -> None:
+        """A refused connection returns None and never auto-launches."""
+        from ocr_tts.queue import send_clear_request
+
+        with (
+            patch(
+                "urllib.request.urlopen",
+                side_effect=urllib.error.URLError(ConnectionRefusedError("no")),
+            ),
+            patch("ocr_tts.queue._launch_server") as launch,
+        ):
+            assert send_clear_request(host="h", port=1) is None
+        launch.assert_not_called()
+
+    def test_non_connection_urlerror_exits(self) -> None:
+        """A non-refused URL error escalates to a non-zero exit."""
+        from ocr_tts.queue import send_clear_request
+
+        with (
+            patch(
+                "urllib.request.urlopen",
+                side_effect=urllib.error.URLError("dns failure"),
+            ),
+            pytest.raises(typer.Exit),
+        ):
+            send_clear_request(host="h", port=1)

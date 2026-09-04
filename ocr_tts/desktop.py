@@ -112,7 +112,7 @@ def _monitor_bounds_tkinter() -> dict[str, int]:
 def _primary_monitor() -> dict[str, int]:
     """Return the primary monitor bounds as a mss-style dict."""
     try:
-        with mss.mss() as sct:
+        with mss.MSS() as sct:
             monitor = sct.monitors[1]
     except Exception as exc:
         logger.info("mss monitor lookup failed (%s); probing via tkinter instead", exc)
@@ -150,7 +150,7 @@ def _capture_region_x11(x: int, y: int, w: int, h: int) -> Image.Image:
     last_error: Exception | None = None
     for attempt in range(2):
         try:
-            with mss.mss() as sct:
+            with mss.MSS() as sct:
                 shot = sct.grab(monitor)
                 image = Image.frombytes("RGB", shot.size, shot.rgb)
         except Exception as exc:

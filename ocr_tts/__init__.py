@@ -5,9 +5,8 @@ and text-to-speech capabilities.
 """
 
 import time
-from importlib.metadata import version
 
-__version__ = version("ocr-tts")
+from ocr_tts._version import __version__
 
 # Captured at the top of this, the first module Python imports, so it is
 # as close to actual process launch as we can get from inside the process.

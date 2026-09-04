@@ -1,8 +1,13 @@
-# text2speech
+# Text-to-Speech with OCR-TTS
 
 Text-to-speech wrapper for [piper-tts](https://github.com/rhasspy/piper) that
 converts text to speech and saves it as a WAV file, with a streaming FastAPI
 server that supports both input queueing and output streaming.
+
+The CLI commands and server features described here are available under the
+`ocr-tts text2speech` and `ocr-tts api` subcommands (see [README.md](README.md)
+for complete documentation including hotkey-watcher, OCR region extraction, and
+project setup).
 
 ## Installation
 
@@ -13,48 +18,31 @@ ocr-tts:
 uv sync --dev
 ```
 
-## CLI Usage
+For full CLI documentation with examples and options, see
+[README.md](README.md).
 
-### Basic Usage
+## Text-to-Speech CLI
 
-Convert text to speech with default settings:
-
-```bash
-text2speech "Hello, world!"
-```
-
-This will:
-
-- Use the default voice (`en_US-hfc_male-medium`)
-- Save output to `output.wav` in the current directory
-- Automatically download the required model files to `.piper-voices/` (if missing)
-
-### Specify Output File
+The `ocr-tts text2speech` command converts text to speech and saves
+it as a WAV file.
 
 ```bash
-text2speech "Hello, world!" -o greeting.wav
-text2speech "Hello, world!" --output greeting.wav
+# Basic usage
+ocr-tts text2speech "Hello, world!"
+
+# Specify output file
+ocr-tts text2speech "Hello!" -o greeting.wav
+
+# Choose a voice
+ocr-tts text2speech "Bonjour!" -v fr_FR-siwis-medium
+
+# Adjust speed (0.5-2.0)
+ocr-tts text2speech "Hello!" --speed 0.8  # Slower
+ocr-tts text2speech "Hello!" --speed 1.5  # Faster
 ```
 
-### Choose a Voice
-
-```bash
-text2speech "Hello!" -v en_US-lessac-medium
-text2speech "Bonjour!" -v fr_FR-siwis-medium
-```
-
-### Adjust Speed
-
-```bash
-text2speech "Hello!" --speed 0.8  # Slower
-text2speech "Hello!" --speed 1.5  # Faster
-```
-
-### Custom Voice Directory
-
-```bash
-text2speech "Hello!" --voice-dir /path/to/voices
-```
+See [README.md](README.md) for more detailed examples including
+voice aliases, speed ranges, and additional options.
 
 ## Available Voices
 
@@ -96,13 +84,13 @@ HuggingFace repository.
 
 ## Streaming API
 
-The package includes a FastAPI server (`tts-api`) that supports both input
+The package includes a FastAPI server (OCR-TTS API) that supports both input
 queueing and output streaming:
 
 ### Start the Server
 
 ```bash
-uv run tts-api   # serves on http://localhost:8000
+uv run ocr-tts api launch   # serves on http://localhost:8000
 ```
 
 ### Non-streaming synthesis (WAV)
@@ -143,46 +131,40 @@ curl -X POST http://localhost:8000/queue \
 curl -N http://localhost:8000/queue/stream --output queue.raw
 ```
 
-### Controlling the queue from the CLI (`speak`)
+### Controlling the Queue from the CLI
 
-The `speak` command is a remote control for the running server's queue.
-Text is appended to the queue and spoken after anything already queued,
-so it works even when the queue is empty:
+The `ocr-tts api send-text` command queues text on the running server:
+
+- Each queued item carries its own voice and speed
+- Switching voice/speed mid-queue affects only text submitted after the switch
+- Text already in the queue keeps its original settings
 
 ```bash
 # Add text to the running queue (server must be running)
-uv run speak "Hello, world!"
+ocr-tts api send-text "Hello, world!"
 
 # Add text with a different voice and speed
-uv run speak "Bonjour!" -v fr_FR-siwis-medium -s 1.2
+ocr-tts api send-text "Bonjour!" -v fr_FR-siwis-medium -s 1.2
 
 # Point at a server on a different host/port
-uv run speak "Hi" --host 192.168.1.10 --port 9000
+ocr-tts api send-text "Hi" --host 192.168.1.10 --port 9000
 
 # Wipe the queue and immediately stop playback
-uv run ocr-tts api clear
+ocr-tts api clear
 ```
 
-Each item carries its own voice and speed.  Switching voice/speed
-mid-queue affects only text submitted after the switch — text already in
-the queue keeps the settings it was submitted with:
-
-```bash
-uv run speak "English text" -v en_US-lessac-medium
-# still speaking in English...
-uv run speak "Français" -v fr_FR-siwis-medium   # switches once reached
-```
-
-To clear the queue over HTTP directly, use `POST /queue/clear`; it wipes
-all pending text and audio and stops playback of any in-flight item.
+For detailed documentation including verbose latency reporting and
+send-region, see [README.md](README.md).
 
 ## Options
+
+See [README.md](README.md) for complete CLI options. Key options include:
 
 - `TEXT` - Required text to convert to speech
 - `-o, --output PATH` - Output WAV file path (default: output.wav)
 - `-v, --voice NAME` - Voice name (default: en_US-hfc_male-medium)
 - `--voice-dir PATH` - Directory for voice/model files (default: .piper-voices)
-- `-s, --speed FLOAT` - Speech speed multiplier, 0.5-2.0 (default: 1.0)
+- `-s, --speed FLOAT` - Speech speed multiplier (default: 1.0)
 - `-V, --version` - Show version and exit
 
 ## Examples
@@ -190,19 +172,21 @@ all pending text and audio and stops playback of any in-flight item.
 ### Simple greeting
 
 ```bash
-text2speech "Welcome to OCR-TTS toolkit!"
+ocr-tts text2speech "Welcome to OCR-TTS toolkit!"
 ```
 
 ### French text
 
 ```bash
-text2speech "Bonjour, comment allez-vous?" -v fr_FR-siwis-medium -o french.wav
+ocr-tts text2speech "Bonjour, comment allez-vous?" \
+  -v fr_FR-siwis-medium -o french.wav
 ```
 
 ### Slow, clear speech
 
 ```bash
-text2speech "This is a test of the text-to-speech system." --speed 0.8 -o slow.wav
+text2speech "This is a test of the text-to-speech system." \
+  --speed 0.8 -o slow.wav
 ```
 
 ### Fast speech
@@ -239,4 +223,5 @@ Common issues:
 
 - [piper-tts GitHub](https://github.com/rhasspy/piper)
 - [rhasspy/piper-voices](https://huggingface.co/rhasspy/piper-voices)
-- [ocr-region CLI](../README.md) - OCR screen region selection
+- [README.md](README.md) - Complete OCR-TTS documentation
+  including hotkey-watcher, OCR region extraction, and API endpoints

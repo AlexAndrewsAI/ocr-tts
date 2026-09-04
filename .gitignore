@@ -1,5 +1,6 @@
 # Project Specific
-*.wav
+temp.*
+*.temp
 
 REVIEW.md
 

@@ -22,12 +22,11 @@ All synthesis runs offline using ONNX Runtime via Piper.
 
 import asyncio
 import contextlib
-import io
 import logging
 import queue
+import struct
 import threading
 import time
-import wave
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -42,6 +41,7 @@ from ocr_tts.text2speech import (
     DEFAULT_VOICE,
     DEFAULT_VOICE_DIR,
     PiperTTS,
+    VoiceDownloadError,
     ensure_voice,
     get_voice_dir,
     resolve_voice_alias,
@@ -59,6 +59,54 @@ app = FastAPI(
 # State
 # --------------------------------------------------------------------------- #
 
+
+class _ItemRecord:
+    """Per-enqueue-item latency and completion tracking.
+
+    One record is created for every ``POST /queue`` item and bundled with
+    the item on the text queue.  The synthesis worker and the playback
+    thread publish their measurements to the *same* record the requesting
+    endpoint later reads, so interleaved verbose requests never see
+    another item's latency (the previous shared last-value counters did).
+
+    Completion is signalled through two :class:`asyncio.Event` objects that
+    are set from worker threads via :meth:`loop.call_soon_threadsafe`:
+
+    * :attr:`first_audio` — the first chunk of this item was written to the
+      sink (audio started speaking).
+    * :attr:`processed` — synthesis of this item finished (or failed).
+    """
+
+    __slots__ = (
+        "first_audio",
+        "loop",
+        "piper_latency_s",
+        "processed",
+        "synthesis_s",
+    )
+
+    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Initialize the record bound to ``loop``.
+
+        Args:
+            loop: The event loop that will await the completion events.
+
+        """
+        self.loop = loop
+        self.synthesis_s: float | None = None
+        self.piper_latency_s: float | None = None
+        self.first_audio = asyncio.Event()
+        self.processed = asyncio.Event()
+
+    def set_first_audio(self) -> None:
+        """Signal (thread-safely) that this item's audio has started."""
+        self.loop.call_soon_threadsafe(self.first_audio.set)
+
+    def set_processed(self) -> None:
+        """Signal (thread-safely) that this item finished synthesizing."""
+        self.loop.call_soon_threadsafe(self.processed.set)
+
+
 # Cache of TTS engines keyed by (voice, voice_dir).  One engine is
 # created per distinct voice so the queue can switch voices mid-play.
 _tts_cache: dict[tuple[str, str], PiperTTS] = {}
@@ -69,7 +117,7 @@ _tts_lock = threading.Lock()
 _start_lock = threading.Lock()
 
 # Queues for input queueing and output streaming
-_text_queue: asyncio.Queue[tuple[str, str, float]] | None = None
+_text_queue: "asyncio.Queue[tuple[str, str, float, _ItemRecord]] | None" = None
 _audio_queue: queue.Queue[Any] | None = None
 _queue_processor_task: asyncio.Task | None = None
 
@@ -93,20 +141,21 @@ _playback_shutdown = threading.Event()
 # Guarded by the single-item serialization of the queue processor.
 _synthesis_start_time: float | None = None
 
-# Per-item accounting used to report latency to a verbose ``POST /queue``
-# that asked the server to wait for the item to be synthesized.  Items are
-# processed strictly serially by the queue processor, so the "last" item's
-# counters correspond to the most recently completed utterance.
+# The per-item record for the utterance currently being synthesized/played.
+# Synthesis and playback are serialized (one item at a time), so a single
+# "current" reference is unambiguous; the worker threads stash their
+# measurements on this record rather than on shared last-value globals.
+_current_item: _ItemRecord | None = None
+
+# Monotonic counter used only for logging/debugging enqueue order.
 _enqueued_count = 0
-_processed_count = 0
-_last_item_synthesis_s: float | None = None
-_last_item_piper_latency_s: float | None = None
-# Number of items whose first audio chunk has actually been played.  This is
-# incremented by the playback thread inside :func:`_log_first_audio_latency`
-# the moment the first chunk of an utterance is written to the sink, so a
-# verbose ``POST /queue`` can unblock as soon as the audio *starts* rather
-# than waiting for the whole utterance to finish synthesizing.
-_first_audio_played_count = 0
+
+# Reference to the :class:`asyncio.Future` of the in-flight
+# ``run_in_executor(_synthesize_item, ...)`` call, if any.  Kept so
+# :func:`_stop_queue_processor` can join the worker thread after cancelling
+# the processor task instead of orphaning it.  Only ever written from the
+# event loop.
+_current_executor_task: asyncio.Future[None] | None = None
 
 # How long a verbose ``POST /queue`` waits for its item to be processed
 # before giving up and returning whatever latency data is available.
@@ -238,19 +287,41 @@ async def _start_queue_processor() -> None:
 async def _stop_queue_processor() -> None:
     """Cancel and join the background queue processor task, if any.
 
-    Used by ``/queue/clear`` to stop processing so no pending or future
-    items are synthesized until new text is queued again (which restarts
-    the task via :func:`_start_queue_processor`).
+    Used by ``/queue/clear`` and ``/shutdown`` to stop processing so no
+    pending or future items are synthesized until new text is queued again
+    (which restarts the task via :func:`_start_queue_processor`).
+
+    Cancelling the asyncio task does not stop the executor thread already
+    synthesizing an item, so any in-flight ``run_in_executor`` future is
+    joined (with a bounded timeout) to allow that thread to finish and
+    record its result before the queue re-enables.
     """
-    global _queue_processor_task
+    global _queue_processor_task, _current_executor_task
     task = _queue_processor_task
+    # Capture the in-flight executor future *before* cancelling, because the
+    # processor loop's finally clause clears it once the await is cancelled.
+    fut = _current_executor_task
     if task is not None and not task.done():
         logger.info("Cancelling queue processor task")
         task.cancel()
-        with contextlib.suppress(asyncio.CancelledError, Exception):
+        try:
             await task
+        except asyncio.CancelledError:
+            logger.info("Queue processor task cancelled")
+        except Exception as exc:
+            logger.exception("Queue processor task stopped with error: %s", exc)
         logger.info("Queue processor task stopped")
     _queue_processor_task = None
+
+    if fut is not None and not fut.done():
+        logger.info("Joining in-flight synthesis executor task")
+        try:
+            await asyncio.wait_for(asyncio.shield(fut), timeout=5.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            logger.warning("In-flight synthesis executor task did not stop in time")
+        except Exception as exc:
+            logger.exception("In-flight synthesis executor task errored: %s", exc)
+    _current_executor_task = None
 
 
 def _start_playback(
@@ -289,6 +360,43 @@ def _start_playback(
         logger.info("Playback thread started successfully")
 
 
+def _stop_playback() -> None:
+    """Stop the playback thread and retire its audio sink deterministically.
+
+    Sets the shutdown flag and wakes any blocked ``audio_queue`` wait by
+    pushing a sentinel, then joins the thread.  Because the sink is only
+    closed *after* the thread has exited, the old thread can never race a
+    ``close()`` issued from this (or any other) thread.  If the thread is
+    still alive after the join timeout it keeps ownership of its own sink
+    object until it observes the shutdown flag and exits; a fresh sink is
+    installed for any subsequent playback.
+
+    Used by ``POST /download`` before swapping the voice cache so the old
+    voice cannot keep playing into the new sink.
+
+    """
+    global _playback_sink
+    _playback_shutdown.set()
+    thread = _playback_thread
+    if thread is not None and thread.is_alive():
+        current_queue = _audio_queue
+        if current_queue is not None:
+            with contextlib.suppress(Exception):
+                current_queue.put_nowait(_AUDIO_SENTINEL)
+        thread.join(timeout=3.0)
+        if thread.is_alive():
+            logger.warning(
+                "Playback thread did not stop cleanly; "
+                "old sink will be closed by its owning thread"
+            )
+            # The old thread still owns the old sink; give it a fresh one.
+            _playback_sink = SounddeviceSink()  # type: ignore[misc]
+            return
+    # The thread is dead (or was never running): safe to close its sink.
+    _playback_sink.close()
+    _playback_sink = SounddeviceSink()  # type: ignore[misc]
+
+
 def _log_first_audio_latency() -> None:
     """Log the time from Piper model start to the first played chunk.
 
@@ -296,20 +404,23 @@ def _log_first_audio_latency() -> None:
     when the model began processing the current utterance) and reports how
     long it took until the first audio chunk was actually written to the
     sink — i.e. when the server started speaking.  The measured latency is
-    also stashed on :data:`_last_item_piper_latency_s` so a verbose
-    ``POST /queue`` can return it to the client.
+    also stashed on the current item's :class:`_ItemRecord` so the
+    corresponding verbose ``POST /queue`` can return it to the client, and
+    the record's ``first_audio`` event is set to unblock that waiter.
 
-    Increments :data:`_first_audio_played_count` so a waiting verbose
-    request can unblock the moment the audio *starts* playing, instead of
-    having to wait for the entire utterance to finish synthesizing.
+    If no worker thread has recorded a start time (e.g. headless server
+    where the sink never opens), the helper merely notes that playback
+    started and does not signal any item.
     """
-    global _synthesis_start_time, _last_item_piper_latency_s, _first_audio_played_count
+    global _synthesis_start_time
     if _synthesis_start_time is None:
         logger.info("Audio playback started (first chunk written)")
         return
     latency = time.time() - _synthesis_start_time
-    _last_item_piper_latency_s = latency
-    _first_audio_played_count += 1
+    item = _current_item
+    if item is not None:
+        item.piper_latency_s = latency
+        item.set_first_audio()
     _synthesis_start_time = None
     logger.info(
         "Audio playback started — Piper-to-speech latency: %.3fs",
@@ -429,7 +540,7 @@ def _playback_loop(
                 _log_first_audio_latency()
             try:
                 sink.write(chunk.audio_int16_bytes)
-                logger.info(
+                logger.debug(
                     "[%s] Playing audio chunk: %d bytes (sample_rate=%d, channels=%d)",
                     time.strftime("%H:%M:%S"),
                     len(chunk.audio_int16_bytes),
@@ -460,6 +571,7 @@ def _synthesize_item(
     speed: float,
     generation: int,
     audio_queue: queue.Queue[Any],
+    item: _ItemRecord,
 ) -> None:
     """Synthesize one queued item, forwarding chunks to the audio queue.
 
@@ -474,9 +586,10 @@ def _synthesize_item(
         speed: Speed multiplier for this item.
         generation: Queue generation captured when the item was dequeued.
         audio_queue: Thread-safe queue receiving the audio chunks.
+        item: The per-item record to publish latency to.
 
     """
-    global _synthesis_start_time, _last_item_synthesis_s
+    global _synthesis_start_time, _current_item
     start_time = time.time()
     logger.info(
         "_synthesize_item called for: %s (generation=%d, audio_queue=%s)",
@@ -489,6 +602,7 @@ def _synthesize_item(
         # Record the moment the Piper model begins processing so the playback
         # thread can report how long until the first audio is actually spoken.
         _synthesis_start_time = time.time()
+        _current_item = item
         logger.info(
             "Piper model started processing text: %s (latency clock started at %.6f)",
             text[:50],
@@ -509,7 +623,7 @@ def _synthesize_item(
             chunk_count += 1
             try:
                 audio_queue.put(chunk, timeout=5.0)
-                logger.info(
+                logger.debug(
                     "Chunk %d queued to audio_queue (sample_rate=%d, bytes=%d, "
                     "queue_id=%s)",
                     chunk_count,
@@ -525,7 +639,8 @@ def _synthesize_item(
                 )
                 raise
         elapsed = time.time() - start_time
-        _last_item_synthesis_s = elapsed
+        item.synthesis_s = elapsed
+        item.set_processed()
         logger.info(
             "Synthesized %d chunks and queued audio for: %s (%.3fs)",
             chunk_count,
@@ -550,17 +665,17 @@ async def _queue_processor_loop() -> None:
     using each item's own voice and speed, and forwards each audio chunk
     to the audio output queue for streaming.
     """
-    global _processed_count
+    global _current_executor_task
     text_queue, _ = await _ensure_queues()
     loop = asyncio.get_event_loop()
     logger.info("Queue processor loop started with loop=%s", loop)
 
     while True:
-        logger.info(
+        logger.debug(
             "Queue processor waiting for next item (queue_size=%d)",
             text_queue.qsize(),
         )
-        text, voice, speed = await text_queue.get()
+        text, voice, speed, item = await text_queue.get()
         logger.info(
             "Queue processor got item: text=%r, voice=%s, speed=%.1f",
             text[:80],
@@ -573,11 +688,14 @@ async def _queue_processor_loop() -> None:
                 logger.error(
                     "audio_queue is None, cannot synthesize item: %s", text[:80]
                 )
+                item.set_processed()
                 continue
             logger.info("Getting/creating TTS engine for voice=%s", voice)
             tts = get_or_create_tts(voice=voice)
             logger.info("TTS engine ready, starting synthesis for: %s", text[:80])
-            await loop.run_in_executor(
+            # Keep a reference to the running executor future so
+            # _stop_queue_processor can join the worker thread on cancel.
+            fut = loop.run_in_executor(
                 None,
                 _synthesize_item,
                 tts,
@@ -585,13 +703,19 @@ async def _queue_processor_loop() -> None:
                 speed,
                 _clear_generation,
                 audio_queue,
+                item,
             )
+            _current_executor_task = fut
+            try:
+                await fut
+            finally:
+                _current_executor_task = None
             logger.info("Synthesis completed for: %s", text[:80])
-            _processed_count += 1
         except Exception as exc:
             logger.exception("Error processing queued item %r: %s", text, exc)
-            # Unblock any verbose waiters even though the item failed.
-            _processed_count += 1
+            # Signal any waiting verbose requester that this item failed so
+            # it unblocks rather than hanging for the full timeout.
+            item.set_processed()
         finally:
             # Signal end of utterance so playback closes the sink and
             # waits for the next item instead of blocking forever.
@@ -640,16 +764,10 @@ async def download_voice(request: DownloadRequest) -> dict[str, Any]:
         request.voice,
     )
 
-    # Stop playback before clearing state
-    _playback_shutdown.set()
-    if _playback_thread is not None and _playback_thread.is_alive():
-        logger.info("Stopping playback thread for voice download")
-        _playback_thread.join(timeout=2.0)
-        if _playback_thread.is_alive():
-            logger.warning("Playback thread did not stop cleanly")
-
-    logger.info("Closing current audio sink")
-    _playback_sink.close()
+    # Stop playback deterministically (join the thread, then close its
+    # sink) so the old voice cannot race the sink teardown, then clear the
+    # TTS cache so the newly downloaded voice is used from here on.
+    _stop_playback()
 
     # Clear the TTS cache to ensure newly downloaded voices are used
     with _tts_lock:
@@ -663,10 +781,20 @@ async def download_voice(request: DownloadRequest) -> dict[str, Any]:
 
     resolved_voice = resolve_voice_alias(request.voice)
     voice_dir = get_voice_dir(request.voice_dir)
+    # Run the (potentially minutes-long) download in an executor thread so
+    # the asyncio event loop stays responsive for other requests.
+    loop = asyncio.get_running_loop()
     try:
         logger.info("Ensuring voice files exist for: %s", resolved_voice)
-        model_path, config_path = ensure_voice(resolved_voice, voice_dir)
+        model_path, config_path = await loop.run_in_executor(
+            None, ensure_voice, resolved_voice, voice_dir
+        )
         logger.info("Voice files verified for: %s", resolved_voice)
+    except VoiceDownloadError as e:
+        logger.error("Voice download failed for %s: %s", request.voice, e)
+        _playback_shutdown.clear()
+        _playback_sink = SounddeviceSink()  # type: ignore[misc]
+        raise HTTPException(502, f"Download failed: {e}") from e
     except ValueError as e:
         logger.error("Voice validation failed for %s: %s", request.voice, e)
         _playback_shutdown.clear()
@@ -699,19 +827,23 @@ async def download_voice(request: DownloadRequest) -> dict[str, Any]:
 
 @app.post("/synthesize")
 async def synthesize(request: SynthesizeRequest) -> StreamingResponse:
-    """Synthesize text to a complete WAV file (non-streaming).
+    """Synthesize text to a WAV file (streamed, not buffered in full).
 
-    The entire audio is generated and returned as a WAV file.
+    The complete audio is returned as a WAV file.  Audio is streamed to
+    the response as each chunk is produced, so arbitrarily long text does
+    not require buffering the entire waveform in memory.  The WAV header
+    declares an unknown (0xFFFFFFFF) data length, the standard convention
+    for variable-length streaming audio.
 
     Args:
         request: Text, voice, and speed parameters.
 
     Returns:
-        StreamingResponse containing WAV audio bytes.
+        StreamingResponse containing WAV audio.
 
     """
     logger.info(
-        "Synthesizing complete WAV: %s (voice=%s, speed=%.1f)",
+        "Synthesizing streamed WAV: %s (voice=%s, speed=%.1f)",
         request.text[:50],
         request.voice,
         request.speed,
@@ -719,32 +851,63 @@ async def synthesize(request: SynthesizeRequest) -> StreamingResponse:
     tts = get_or_create_tts(voice=request.voice)
     loop = asyncio.get_event_loop()
 
-    def _generate_wav() -> bytes:
-        chunks = list(tts.synthesize(request.text, speed=request.speed))
-        if not chunks:
-            return b""
-        first = chunks[0]
-        buf = io.BytesIO()
-        with wave.open(buf, "wb") as wav:
-            wav.setnchannels(first.sample_channels)
-            wav.setsampwidth(first.sample_width)
-            wav.setframerate(first.sample_rate)
-            for chunk in chunks:
-                wav.writeframes(chunk.audio_int16_bytes)
-        return buf.getvalue()
+    def _make_header(first: Any) -> bytes:
+        """Build a WAV header for the given chunk's sample parameters."""
+        data_size = 0xFFFFFFFF
+        byte_rate = first.sample_rate * first.sample_channels * first.sample_width
+        block_align = first.sample_channels * first.sample_width
+        riff_size = 0xFFFFFFFF
+        return struct.pack(
+            "<4sI4s4sIHHIIHH4sI",
+            b"RIFF",
+            riff_size,
+            b"WAVE",
+            b"fmt ",
+            16,
+            1,
+            first.sample_channels,
+            first.sample_rate,
+            byte_rate,
+            block_align,
+            first.sample_width * 8,
+            b"data",
+            data_size,
+        )
 
-    wav_bytes = await loop.run_in_executor(None, _generate_wav)
-    if not wav_bytes:
+    chunk_queue: asyncio.Queue = asyncio.Queue()
+    sentinel: object = object()
+
+    def _worker() -> None:
+        """Run Piper synthesis in a thread, forwarding to asyncio."""
+        try:
+            for chunk in tts.synthesize(request.text, speed=request.speed):
+                asyncio.run_coroutine_threadsafe(chunk_queue.put(chunk), loop).result()
+        except Exception as exc:
+            logger.error("Synthesis error: %s", exc)
+        finally:
+            asyncio.run_coroutine_threadsafe(chunk_queue.put(sentinel), loop).result()
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+    # Peek at the first chunk up front so we can build the WAV header from its
+    # sample parameters and reject empty output with a 400 (cleanly, before
+    # the response has begun streaming) instead of an empty 200.
+    first = await chunk_queue.get()
+    if first is sentinel:
         raise HTTPException(400, "No audio generated from text")
+    header = _make_header(first)
 
-    logger.info(
-        "Complete WAV generated: %s (%.3f KB)",
-        request.text[:50],
-        len(wav_bytes) / 1024,
-    )
+    async def _generate_wav() -> AsyncIterator[bytes]:
+        yield header
+        yield first.audio_int16_bytes
+        while True:
+            chunk = await chunk_queue.get()
+            if chunk is sentinel:
+                break
+            yield chunk.audio_int16_bytes
 
     return StreamingResponse(
-        io.BytesIO(wav_bytes),
+        _generate_wav(),
         media_type="audio/wav",
     )
 
@@ -799,8 +962,8 @@ async def synthesize_stream(request: SynthesizeRequest) -> StreamingResponse:
     )
 
 
-async def _wait_for_first_audio_or_processed(index: int, timeout: float) -> str:
-    """Wait until the *index*-th item either starts playing or finishes.
+async def _wait_for_item(item: _ItemRecord, timeout: float) -> None:
+    """Wait until *item* either starts playing or finishes.
 
     A verbose ``POST /queue`` should return (and the client should compute
     its turnaround) the moment the audio *starts* — i.e. when the playback
@@ -808,37 +971,38 @@ async def _wait_for_first_audio_or_processed(index: int, timeout: float) -> str:
     utterance has finished synthesizing, since the audio begins streaming
     several seconds before the last chunk is produced.
 
-    The first-chunk event is signalled by
-    :data:`_first_audio_played_count` (incremented in
-    :func:`_log_first_audio_latency` when the first chunk is written).  On a
-    headless server with no audio device the sink never opens, so the
-    first-chunk event never fires; in that case we fall back to
-    :data:`_processed_count` (end of synthesis) so the request still
-    unblocks and can report ``latency_ms: n/a``.
+    Waits on the item's two completion events with ``FIRST_COMPLETED``.  On
+    a headless server with no audio device the sink never opens, so the
+    ``first_audio`` event never fires; in that case we fall back to the
+    ``processed`` event (end of synthesis) so the request still unblocks and
+    can report ``latency_ms: n/a``.  If the ``first_audio`` path fires first
+    but synthesis is not yet finished, a brief grace window waits for
+    ``processed`` so the synthesis time can also be reported.
 
     Args:
-        index: The 1-based enqueue index to wait for.
+        item: The per-item record to wait on.
         timeout: Maximum seconds to wait.
 
-    Returns:
-        ``"first_audio"`` if the first chunk played before the timeout,
-        ``"processed"`` if synthesis completed first (or failed), and
-        ``"timeout"`` if neither happened before the timeout elapsed.
-
     """
-    loop = asyncio.get_event_loop()
-    deadline = loop.time() + timeout
-    while loop.time() < deadline:
-        if _first_audio_played_count >= index:
-            return "first_audio"
-        if _processed_count >= index:
-            return "processed"
-        await asyncio.sleep(0.02)
-    if _first_audio_played_count >= index:
-        return "first_audio"
-    if _processed_count >= index:
-        return "processed"
-    return "timeout"
+    first_audio_task = asyncio.ensure_future(item.first_audio.wait())
+    processed_task = asyncio.ensure_future(item.processed.wait())
+    with contextlib.suppress(asyncio.TimeoutError):
+        await asyncio.wait(
+            {first_audio_task, processed_task},
+            return_when=asyncio.FIRST_COMPLETED,
+            timeout=timeout,
+        )
+    # Whichever event fired first, the other (synthesis_ms and latency_ms)
+    # may lag by a few milliseconds.  Give a brief grace window for the
+    # remaining event so both values are usually available on the response —
+    # mirroring the previous implementation's 0.5s grace loop.
+    for pending in (first_audio_task, processed_task):
+        if not pending.done():
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(pending, timeout=0.5)
+    for pending in (first_audio_task, processed_task):
+        if not pending.done():
+            pending.cancel()
 
 
 @app.post("/queue")
@@ -890,6 +1054,11 @@ async def queue_text(request: SynthesizeRequest) -> dict[str, Any]:
     logger.info("Got event loop: %s", loop)
     _start_playback(loop, audio_queue)
     logger.info("Playback thread started/verified")
+    # Create the per-item record and bundle it with the item so the
+    # processor and playback workers publish to the exact record this
+    # request later reads (per-item, not shared last-value counters).
+    item = _ItemRecord(loop)
+    _enqueued_count += 1
     timestamp = time.strftime("%H:%M:%S")
     logger.info(
         "[%s] Message queued: %s (voice=%s, speed=%.1f, queue_size=%d)",
@@ -899,9 +1068,7 @@ async def queue_text(request: SynthesizeRequest) -> dict[str, Any]:
         request.speed,
         text_queue.qsize(),
     )
-    await text_queue.put((request.text, resolved_voice, request.speed))
-    _enqueued_count += 1
-    my_index = _enqueued_count
+    await text_queue.put((request.text, resolved_voice, request.speed, item))
     logger.info("Message put into text_queue, new queue_size=%d", text_queue.qsize())
 
     response: dict[str, Any] = {
@@ -911,23 +1078,13 @@ async def queue_text(request: SynthesizeRequest) -> dict[str, Any]:
     if not request.wait:
         return response
 
-    await _wait_for_first_audio_or_processed(my_index, timeout=_QUEUE_WAIT_TIMEOUT_S)
-    # The first-audio path guarantees _last_item_piper_latency_s is set; on
-    # the headless fallback path synthesis has completed so the synthesis
-    # time is set too.  Either way, give the other thread a brief grace
-    # window to publish its values before we report.
-    for _ in range(50):
-        if _last_item_synthesis_s is not None:
-            break
-        await asyncio.sleep(0.01)
+    await _wait_for_item(item, timeout=_QUEUE_WAIT_TIMEOUT_S)
     response["synthesis_ms"] = (
-        round(_last_item_synthesis_s * 1000, 3)
-        if _last_item_synthesis_s is not None
-        else None
+        round(item.synthesis_s * 1000, 3) if item.synthesis_s is not None else None
     )
     response["latency_ms"] = (
-        round(_last_item_piper_latency_s * 1000, 3)
-        if _last_item_piper_latency_s is not None
+        round(item.piper_latency_s * 1000, 3)
+        if item.piper_latency_s is not None
         else None
     )
     return response
@@ -1047,23 +1204,25 @@ async def shutdown() -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 
 
-def serve(host: str = "0.0.0.0", port: int = 8000) -> None:  # noqa: S104
+def serve(host: str = "127.0.0.1", port: int = 8000) -> None:
     """Run the API server with uvicorn.
+
+    Binds to loopback by default so the destructive control endpoints
+    (``/queue/clear``, ``/shutdown``) are not exposed to the LAN without
+    an explicit ``--host 0.0.0.0``.  The queue client already connects to
+    the loopback default, so its tooling is unaffected.
 
     Args:
         host: Bind address.
         port: Listen port.
 
     """
-    import logging
-
     import uvicorn
 
-    # Configure logging to ensure application INFO logs appear in terminal
-    logging.basicConfig(
-        level=logging.INFO,
-        format="INFO:     %(message)s",
-    )
+    # Uvicorn configures logging itself (level-aware formatter via its default
+    # ``log_config``), so no homegrown ``basicConfig`` is needed here; calling
+    # one would clobber uvicorn's setup and mislabel WARNING/ERROR records with
+    # a hardcoded ``INFO:`` prefix.
 
     # Build the server explicitly so the running instance can be stored on
     # ``app.state``; the /shutdown endpoint sets ``server.should_exit`` to
@@ -1074,5 +1233,42 @@ def serve(host: str = "0.0.0.0", port: int = 8000) -> None:  # noqa: S104
     server.run()
 
 
+def _parse_server_args(argv: list[str] | None = None) -> tuple[str, int]:
+    """Parse ``--host`` / ``--port`` for the ``python -m ocr_tts.api`` entry.
+
+    The queue client (`ocr_tts.queue._launch_server`) spawns the server as
+    ``python -m ocr_tts.api --host <host> --port <port>``, so this entry
+    point must honor those flags (previously the spawned server ignored
+    them and always bound the defaults).
+
+    Args:
+        argv: Optional argument list; defaults to ``sys.argv[1:]``.
+
+    Returns:
+        The parsed ``(host, port)`` pair.
+
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="python -m ocr_tts.api",
+        description="Run the OCR-TTS FastAPI server.",
+    )
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Bind address (default: 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8000,
+        help="Listen port (default: 8000)",
+    )
+    args = parser.parse_args(argv)
+    return args.host, args.port
+
+
 if __name__ == "__main__":
-    serve()
+    host, port = _parse_server_args()
+    serve(host=host, port=port)

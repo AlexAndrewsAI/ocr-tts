@@ -73,8 +73,8 @@ class TestOCRConfig:
 
     def test_custom_values(self) -> None:
         """Test custom OCR config values."""
-        config = OCRConfig(tesseract_cmd="/usr/bin/tesseract", lang="fra")
-        assert config.tesseract_cmd == "/usr/bin/tesseract"
+        config = OCRConfig(tesseract_cmd="tesseract", lang="fra")
+        assert config.tesseract_cmd == "tesseract"
         assert config.lang == "fra"
 
     def test_frozen_immutability(self) -> None:
@@ -348,7 +348,7 @@ class TestSelectRegion:
             {"left": 0, "top": 0, "width": 1920, "height": 1080},
         ]
         mock_sct.__enter__.return_value = mock_sct
-        with patch("ocr_tts.desktop.mss.mss", return_value=mock_sct):
+        with patch("ocr_tts.desktop.mss.MSS", return_value=mock_sct):
             monitor = _primary_monitor()
 
         assert monitor == _MONITOR
@@ -381,7 +381,7 @@ class TestCaptureRegion:
         mock_sct = self._mock_sct()
         with (
             patch("ocr_tts.desktop._is_wayland", return_value=False),
-            patch("ocr_tts.desktop.mss.mss", return_value=mock_sct),
+            patch("ocr_tts.desktop.mss.MSS", return_value=mock_sct),
         ):
             image = capture_region(0, 0, 200, 100)
 
@@ -410,7 +410,7 @@ class TestCaptureRegion:
             image = capture_region(0, 0, 200, 100)
 
         assert image.size == mock_image.size
-        assert list(image.getdata()) == list(mock_image.getdata())
+        assert image.get_flattened_data() == mock_image.get_flattened_data()
         mock_wayland.assert_called_once_with(0, 0, 200, 100)
 
     def test_capture_region_falls_back_from_wayland(self) -> None:
@@ -424,7 +424,7 @@ class TestCaptureRegion:
                 "ocr_tts.desktop._capture_region_wayland",
                 side_effect=RuntimeError("no portal"),
             ),
-            patch("ocr_tts.desktop.mss.mss", return_value=mock_sct),
+            patch("ocr_tts.desktop.mss.MSS", return_value=mock_sct),
         ):
             image = capture_region(0, 0, 200, 100)
 
@@ -755,7 +755,7 @@ class TestCaptureBackends:
             patch("ocr_tts.desktop.shutil.which", return_value=None),
             patch.dict(os.environ, {}, clear=True),
             patch(
-                "ocr_tts.desktop.mss.mss",
+                "ocr_tts.desktop.mss.MSS",
                 side_effect=OSError("X11 Protocol Error"),
             ),
             pytest.raises(CaptureError) as exc_info,
@@ -794,7 +794,7 @@ class TestCaptureBackends:
                     "org.freedesktop.DBus.Error.UnknownMethod"
                 ),
             ),
-            patch("ocr_tts.desktop.mss.mss", side_effect=OSError("X11 Protocol Error")),
+            patch("ocr_tts.desktop.mss.MSS", side_effect=OSError("X11 Protocol Error")),
             patch("ocr_tts.desktop._primary_monitor", return_value=monitor),
             patch("ocr_tts.desktop.subprocess.run", side_effect=fake_run) as mock_run,
         ):
@@ -888,7 +888,7 @@ class TestMonitorBoundsTkinter:
             mock_root.winfo_screenwidth.return_value = 800
             mock_root.winfo_screenheight.return_value = 600
             with patch(
-                "ocr_tts.desktop.mss.mss",
+                "ocr_tts.desktop.mss.MSS",
                 side_effect=OSError("no X display"),
             ):
                 monitor = _primary_monitor()
@@ -904,7 +904,7 @@ class TestMonitorBoundsTkinter:
             mock_tk.Tk.side_effect = _FakeTclError("no display")
             with (
                 patch(
-                    "ocr_tts.desktop.mss.mss",
+                    "ocr_tts.desktop.mss.MSS",
                     side_effect=OSError("no X display"),
                 ),
                 pytest.raises(RuntimeError, match="tkinter screen probe"),
@@ -936,7 +936,7 @@ class TestPortalUnavailableCache:
                 "ocr_tts.desktop._capture_region_wayland",
                 side_effect=fail_wayland,
             ),
-            patch("ocr_tts.desktop.mss.mss", side_effect=OSError("bad X")),
+            patch("ocr_tts.desktop.mss.MSS", side_effect=OSError("bad X")),
             pytest.raises(CaptureError),
         ):
             capture_region(0, 0, 10, 10)
@@ -946,7 +946,7 @@ class TestPortalUnavailableCache:
         with (
             patch("ocr_tts.desktop._capture_region_wayland") as mock_wayland,
             patch("ocr_tts.desktop.shutil.which", return_value=None),
-            patch("ocr_tts.desktop.mss.mss", side_effect=OSError("bad X")),
+            patch("ocr_tts.desktop.mss.MSS", side_effect=OSError("bad X")),
             pytest.raises(CaptureError),
         ):
             capture_region(0, 0, 10, 10)
@@ -966,7 +966,7 @@ class TestPortalUnavailableCache:
                 "ocr_tts.desktop._capture_region_wayland",
                 side_effect=RuntimeError("portal busy"),
             ),
-            patch("ocr_tts.desktop.mss.mss", side_effect=OSError("bad X")),
+            patch("ocr_tts.desktop.mss.MSS", side_effect=OSError("bad X")),
             pytest.raises(CaptureError),
         ):
             capture_region(0, 0, 10, 10)
@@ -1107,7 +1107,7 @@ class TestExtractText:
     def test_extract_text_with_custom_config(self) -> None:
         """Test that extract_text uses custom config."""
         mock_image = MagicMock()
-        config = OCRConfig(lang="fra", tesseract_cmd="/usr/bin/tesseract")
+        config = OCRConfig(lang="fra", tesseract_cmd="tesseract")
 
         with patch(
             "ocr_tts.ocr_region.pytesseract.image_to_string",
@@ -1129,6 +1129,21 @@ class TestExtractText:
             text = extract_text(mock_image)
 
         assert text == "Hello"
+
+    def test_extract_text_holds_tesseract_lock(self) -> None:
+        """The global tesseract_cmd mutation is serialised (M8)."""
+        mock_image = MagicMock()
+        lock = MagicMock()
+        with (
+            patch(
+                "ocr_tts.ocr_region.pytesseract.image_to_string",
+                return_value="x",
+            ),
+            patch("ocr_tts.ocr_region._tesseract_lock", lock),
+        ):
+            extract_text(mock_image)
+        assert lock.__enter__.call_count == 1
+        assert lock.__exit__.call_count == 1
 
 
 # CLI Tests

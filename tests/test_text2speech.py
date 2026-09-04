@@ -14,6 +14,7 @@ from typer.testing import CliRunner
 from ocr_tts.text2speech import (
     DEFAULT_VOICE,
     PiperTTS,
+    VoiceDownloadError,
     app,
     download_file,
     ensure_voice,
@@ -137,25 +138,59 @@ class TestDownloadFile:
     def test_invalid_url_scheme_rejected(self, tmp_path: Path) -> None:
         """Test that non-http(s) URL schemes are rejected."""
         dest = tmp_path / "test.txt"
-        with pytest.raises(typer.Exit) as exc_info:
+        with pytest.raises(VoiceDownloadError) as exc_info:
             download_file("file:///etc/passwd", dest)
-        assert exc_info.value.exit_code == 1
+        assert "Invalid URL scheme" in str(exc_info.value)
 
-    @patch("urllib.request.urlretrieve")
-    def test_download_success(self, mock_retrieve: MagicMock, tmp_path: Path) -> None:
-        """Test successful file download."""
+    @patch("urllib.request.urlopen")
+    def test_download_success(self, mock_urlopen: MagicMock, tmp_path: Path) -> None:
+        """Test successful file download writes the payload atomically."""
         dest = tmp_path / "test.txt"
+        mock_urlopen.return_value.__enter__.return_value.read.side_effect = [
+            b"hello ",
+            b"world",
+            b"",
+        ]
         download_file("https://example.com/file.txt", dest)
-        mock_retrieve.assert_called_once_with("https://example.com/file.txt", dest)
+        assert dest.read_bytes() == b"hello world"
+        # No leftover partial/temp files remain.
+        assert list(tmp_path.iterdir()) == [dest]
 
-    @patch("urllib.request.urlretrieve")
-    def test_download_failure(self, mock_retrieve: MagicMock, tmp_path: Path) -> None:
-        """Test download failure handling."""
+    @patch("urllib.request.urlopen")
+    def test_download_failure(self, mock_urlopen: MagicMock, tmp_path: Path) -> None:
+        """Test download failure handling and temp cleanup."""
         dest = tmp_path / "test.txt"
-        mock_retrieve.side_effect = Exception("Network error")
-        with pytest.raises(typer.Exit) as exc_info:
+        mock_urlopen.return_value.__enter__.return_value.read.side_effect = Exception(
+            "Network error"
+        )
+        with pytest.raises(VoiceDownloadError) as exc_info:
             download_file("https://example.com/file.txt", dest)
-        assert exc_info.value.exit_code == 1
+        assert "Network error" in str(exc_info.value)
+        # No partial or destination file is left behind.
+        assert not dest.exists()
+        assert list(tmp_path.iterdir()) == []
+
+    def test_truncated_partial_download_is_cleaned_up(self, tmp_path: Path) -> None:
+        """A failure mid-download removes the partial file (M10)."""
+        dest = tmp_path / "test.bin"
+        resp = MagicMock()
+        resp.read.side_effect = [b"partial", Exception("connection reset")]
+
+        class _Resp:
+            def __enter__(self) -> MagicMock:
+                return resp
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+        with (
+            patch("urllib.request.urlopen", return_value=_Resp()),
+            pytest.raises(VoiceDownloadError),
+        ):
+            download_file("https://example.com/test.bin", dest)
+        assert not dest.exists()
+        # Temp files are removed, leaving an empty directory.
+        assert list(tmp_path.iterdir()) == []
 
 
 class TestPiperTTS:
@@ -244,6 +279,16 @@ class TestText2speechCLI:
         result = runner.invoke(app, ["Hello world"])
         assert result.exit_code == 1
         assert "Error generating speech" in result.output
+
+    @patch("ocr_tts.text2speech.PiperTTS")
+    def test_main_voice_download_error(
+        self, mock_tts: MagicMock, runner: CliRunner
+    ) -> None:
+        """A VoiceDownloadError is reported as a CLI error (exit 1)."""
+        mock_tts.side_effect = VoiceDownloadError("Network error")
+        result = runner.invoke(app, ["Hello world"])
+        assert result.exit_code == 1
+        assert "Error downloading voice" in result.output
 
 
 class TestResolveVoiceAlias:

@@ -44,10 +44,8 @@ def _reset_api_state() -> Iterator[None]:
     api_module._playback_sink = api_module.SounddeviceSink()
     api_module._synthesis_start_time = None
     api_module._enqueued_count = 0
-    api_module._processed_count = 0
-    api_module._first_audio_played_count = 0
-    api_module._last_item_synthesis_s = None
-    api_module._last_item_piper_latency_s = None
+    api_module._current_item = None
+    api_module._current_executor_task = None
     yield
     api_module._playback_shutdown.set()
     thread = api_module._playback_thread
@@ -63,10 +61,8 @@ def _reset_api_state() -> Iterator[None]:
     api_module._playback_sink = api_module.SounddeviceSink()
     api_module._synthesis_start_time = None
     api_module._enqueued_count = 0
-    api_module._processed_count = 0
-    api_module._first_audio_played_count = 0
-    api_module._last_item_synthesis_s = None
-    api_module._last_item_piper_latency_s = None
+    api_module._current_item = None
+    api_module._current_executor_task = None
 
 
 async def _async_wait_until(
@@ -164,6 +160,37 @@ class TestSynthesizeEndpoint:
         )
         assert response.status_code == 400
 
+    @patch("ocr_tts.api.get_or_create_tts")
+    def test_streams_valid_wav_header(
+        self,
+        mock_get_tts: MagicMock,
+        client: TestClient,
+    ) -> None:
+        """Streamed /synthesize output is a well-formed WAV (M11)."""
+        import struct as _struct
+
+        tts = MagicMock()
+        tts.synthesize.return_value = iter([make_chunk()])
+        mock_get_tts.return_value = tts
+
+        response = client.post(
+            "/synthesize",
+            json={"text": "Hello world"},
+        )
+        assert response.status_code == 200
+        body = response.content
+        assert body[:4] == b"RIFF"
+        assert body[8:12] == b"WAVE"
+        assert body[12:16] == b"fmt "
+        # Mono, 16-bit, 22050 Hz.
+        channels, sample_rate = _struct.unpack("<HH", body[22:26])
+        bits_per_sample = _struct.unpack("<H", body[34:36])[0]
+        assert channels == 1
+        assert sample_rate == 22050
+        assert bits_per_sample == 16
+        # Body carries header (44 bytes) plus a PCM frame.
+        assert len(body) > 44
+
 
 class TestSynthesizeStreamEndpoint:
     """Tests for POST /synthesize/stream."""
@@ -244,7 +271,9 @@ class TestQueueEndpoint:
         assert data["queue_size"] == 1
         text_queue = api_module._text_queue
         assert text_queue is not None
-        assert text_queue.get_nowait() == ("Hi there", "en_US-lessac-medium", 1.5)
+        item = text_queue.get_nowait()
+        assert item[0:3] == ("Hi there", "en_US-lessac-medium", 1.5)
+        assert isinstance(item[3], api_module._ItemRecord)
         assert text_queue.empty()
 
     @patch("ocr_tts.api._start_queue_processor")
@@ -263,11 +292,9 @@ class TestQueueEndpoint:
         assert response.status_code == 200
         text_queue = api_module._text_queue
         assert text_queue is not None
-        assert text_queue.get_nowait() == (
-            "Hi there",
-            "en_US-hfc_male-medium",
-            1.0,
-        )
+        item = text_queue.get_nowait()
+        assert item[0:3] == ("Hi there", "en_US-hfc_male-medium", 1.0)
+        assert isinstance(item[3], api_module._ItemRecord)
         assert text_queue.empty()
 
     def test_queue_default_does_not_wait(self, client: TestClient) -> None:
@@ -306,7 +333,8 @@ class TestQueueEndpoint:
         assert data["latency_ms"] is not None
         assert data["latency_ms"] >= 0
         # The first-audio event fired for this item.
-        assert api_module._first_audio_played_count >= 1
+        assert api_module._current_item is not None
+        assert api_module._current_item.first_audio.is_set()
 
     def test_queue_wait_unblocks_at_first_audio_not_end_of_synthesis(self) -> None:
         """The verbose wait returns when audio *starts*, not when it ends.
@@ -343,7 +371,8 @@ class TestQueueEndpoint:
         assert data["latency_ms"] is not None
         assert data["latency_ms"] >= 0
         # The first-audio event fired for this item.
-        assert api_module._first_audio_played_count >= 1
+        assert api_module._current_item is not None
+        assert api_module._current_item.first_audio.is_set()
         # Total synthesis of all three chunks is ~1s, but the wait returns at
         # the first chunk, so the server-side wait must be well under that.
         assert elapsed < 0.9, (
@@ -688,14 +717,19 @@ class TestQueueProcessor:
         mock_get_tts.side_effect = fake_get_tts
 
         async def scenario() -> list[tuple[str, str, float]]:
-            text_queue: asyncio.Queue[tuple[str, str, float]] = asyncio.Queue()
+            text_queue: asyncio.Queue[Any] = asyncio.Queue()
             audio_queue: queue.Queue[Any] = queue.Queue()
             api_module._text_queue = text_queue
             api_module._audio_queue = audio_queue
             task = asyncio.create_task(api_module._queue_processor_loop())
             await asyncio.sleep(0)
-            await text_queue.put(("first", "en_US-lessac-medium", 1.5))
-            await text_queue.put(("second", "fr_FR-siwis-medium", 0.8))
+            loop = asyncio.get_running_loop()
+            await text_queue.put(
+                ("first", "en_US-lessac-medium", 1.5, api_module._ItemRecord(loop))
+            )
+            await text_queue.put(
+                ("second", "fr_FR-siwis-medium", 0.8, api_module._ItemRecord(loop))
+            )
             await _async_wait_until(
                 lambda: len(calls) == 2 and audio_queue.qsize() == 4
             )
@@ -724,6 +758,7 @@ class TestQueueProcessor:
 
             tts = MagicMock()
             tts.synthesize.return_value = chunk_source()
+            item = api_module._ItemRecord(asyncio.get_running_loop())
             await asyncio.get_running_loop().run_in_executor(
                 None,
                 api_module._synthesize_item,
@@ -732,6 +767,7 @@ class TestQueueProcessor:
                 1.0,
                 0,
                 audio_queue,
+                item,
             )
             return audio_queue.qsize()
 
@@ -743,7 +779,7 @@ class TestQueueProcessor:
         api_module._clear_generation = 0
 
         async def scenario() -> list[Any]:
-            text_queue: asyncio.Queue[tuple[str, str, float]] = asyncio.Queue()
+            text_queue: asyncio.Queue[Any] = asyncio.Queue()
             audio_queue: queue.Queue[Any] = queue.Queue()
             api_module._text_queue = text_queue
             api_module._audio_queue = audio_queue
@@ -755,7 +791,8 @@ class TestQueueProcessor:
             with patch("ocr_tts.api.get_or_create_tts", return_value=tts):
                 task = asyncio.create_task(api_module._queue_processor_loop())
                 await asyncio.sleep(0)
-                await text_queue.put(("hello", "en_US-lessac-medium", 1.0))
+                item = api_module._ItemRecord(asyncio.get_running_loop())
+                await text_queue.put(("hello", "en_US-lessac-medium", 1.0, item))
                 await _async_wait_until(lambda: audio_queue.qsize() == 2)
                 task.cancel()
                 with pytest.raises(asyncio.CancelledError):

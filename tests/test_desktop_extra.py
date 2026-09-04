@@ -39,7 +39,7 @@ class TestCaptureRegionX11Failures:
         """Two consecutive blank grabs raise a blank-frame RuntimeError."""
         with (
             patch("ocr_tts.desktop.time.sleep"),
-            patch("ocr_tts.desktop.mss.mss", return_value=_mock_sct(_blank_shot())),
+            patch("ocr_tts.desktop.mss.MSS", return_value=_mock_sct(_blank_shot())),
             pytest.raises(RuntimeError, match="blank frames"),
         ):
             desktop._capture_region_x11(0, 0, 10, 10)
@@ -49,7 +49,7 @@ class TestCaptureRegionX11Failures:
         with (
             patch("ocr_tts.desktop.time.sleep"),
             patch(
-                "ocr_tts.desktop.mss.mss",
+                "ocr_tts.desktop.mss.MSS",
                 side_effect=RuntimeError("no display"),
             ),
             pytest.raises(RuntimeError, match="X11 screen capture failed"),

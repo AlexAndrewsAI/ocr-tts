@@ -35,25 +35,25 @@ class TestRunOcrRegionBlankWarning:
     """Tests for the blank-capture warning in run_ocr_region."""
 
     def test_blank_capture_warns_but_queues(
-        self, speak_item: HotkeyConfigItem, caplog: Any
+        self, speak_item: HotkeyConfigItem, capsys: Any
     ) -> None:
-        """A blank capture logs a warning and still queues detected text."""
+        """A blank capture warns and still queues detected text (M12)."""
         with (
             patch(
-                "ocr_tts.ocr_region.select_region",
+                "ocr_tts.speak_region.select_region",
                 return_value=MagicMock(width=10, height=10),
             ),
-            patch("ocr_tts.ocr_region.capture_selected_region", return_value="img"),
-            patch("ocr_tts.ocr_region.image_is_blank", return_value=True),
-            patch("ocr_tts.ocr_region.extract_text", return_value="words"),
+            patch("ocr_tts.speak_region.capture_selected_region", return_value="img"),
+            patch("ocr_tts.speak_region.image_is_blank", return_value=True),
+            patch("ocr_tts.speak_region.extract_text", return_value="words"),
             patch(
-                "ocr_tts.hotkey_watcher.send_speak_request",
+                "ocr_tts.speak_region.send_speak_request",
                 return_value={"queue_size": 1},
             ) as send,
-            caplog.at_level(logging.WARNING, logger="ocr_tts.hotkey_watcher"),
         ):
             result = run_ocr_region(speak_item)
-        assert "blank" in caplog.text
+        captured = capsys.readouterr()
+        assert "blank" in captured.err.lower()
         assert result == {"status": "ok", "queue_size": 1}
         send.assert_called_once()
 
@@ -80,6 +80,35 @@ class TestExecuteActionEdgeCases:
             pytest.raises(SystemExit),
         ):
             execute_action(speak_item)
+
+    def test_guarded_worker_logs_system_exit(
+        self, speak_item: HotkeyConfigItem, caplog: Any
+    ) -> None:
+        """A SystemExit in a worker is logged, not silently killing the thread."""
+        import ocr_tts.hotkey_watcher as hw
+
+        with (
+            patch("ocr_tts.hotkey_watcher.execute_action", side_effect=SystemExit(3)),
+            caplog.at_level(logging.ERROR, logger="ocr_tts.hotkey_watcher"),
+        ):
+            hw._run_guarded(speak_item)
+        assert "aborted" in caplog.text
+
+    def test_guarded_worker_logs_unexpected_failure(
+        self, speak_item: HotkeyConfigItem, caplog: Any
+    ) -> None:
+        """Any other uncaught failure in a worker is surfaced via logging."""
+        import ocr_tts.hotkey_watcher as hw
+
+        with (
+            patch(
+                "ocr_tts.hotkey_watcher.execute_action",
+                side_effect=RuntimeError("boom"),
+            ),
+            caplog.at_level(logging.ERROR, logger="ocr_tts.hotkey_watcher"),
+        ):
+            hw._run_guarded(speak_item)
+        assert "failed" in caplog.text
 
 
 class _FakeListener:

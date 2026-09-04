@@ -1,6 +1,7 @@
 """Additional coverage tests for the FastAPI server internals."""
 
 import asyncio
+import logging
 import queue
 import threading
 import time
@@ -17,6 +18,7 @@ from piper import AudioChunk
 from ocr_tts import api as api_module
 from ocr_tts.api import app
 from ocr_tts.player import AudioSink
+from ocr_tts.text2speech import VoiceDownloadError
 
 
 @pytest.fixture(autouse=True)
@@ -41,10 +43,8 @@ def _reset_api_state() -> Any:
     api_module._playback_sink = FakeSink()
     api_module._synthesis_start_time = None
     api_module._enqueued_count = 0
-    api_module._processed_count = 0
-    api_module._first_audio_played_count = 0
-    api_module._last_item_synthesis_s = None
-    api_module._last_item_piper_latency_s = None
+    api_module._current_item = None
+    api_module._current_executor_task = None
     with patch.object(api_module, "SounddeviceSink", side_effect=_silent_sink):
         yield
     api_module._playback_shutdown.set()
@@ -322,8 +322,9 @@ class TestSynthesizeItemErrors:
         bad_queue.put.side_effect = RuntimeError("queue closed")
         tts = MagicMock()
         tts.synthesize.return_value = iter([make_chunk()])
+        item = api_module._ItemRecord(asyncio.new_event_loop())
         with pytest.raises(RuntimeError, match="queue closed"):
-            api_module._synthesize_item(tts, "text", 1.0, 0, bad_queue)
+            api_module._synthesize_item(tts, "text", 1.0, 0, bad_queue, item)
 
 
 class TestQueueProcessorEdgePaths:
@@ -343,13 +344,14 @@ class TestQueueProcessorEdgePaths:
         """Items are skipped (with a log) when no audio queue exists."""
 
         async def scenario() -> None:
-            text_queue: asyncio.Queue[tuple[str, str, float]] = asyncio.Queue()
+            text_queue: asyncio.Queue[tuple[str, str, float, Any]] = asyncio.Queue()
             api_module._text_queue = text_queue
             api_module._audio_queue = None
+            item = api_module._ItemRecord(asyncio.get_running_loop())
             with patch("ocr_tts.api._ensure_queues", return_value=(text_queue, None)):
                 task = asyncio.create_task(api_module._queue_processor_loop())
-                await text_queue.put(("hi", "voice", 1.0))
-                await asyncio.sleep(0.1)
+                await text_queue.put(("hi", "voice", 1.0, item))
+                await self._wait_until(lambda: item.processed.is_set())
                 task.cancel()
                 with pytest.raises(asyncio.CancelledError):
                     await task
@@ -357,19 +359,20 @@ class TestQueueProcessorEdgePaths:
         asyncio.run(scenario())
 
     def test_tts_failure_counts_as_processed(self) -> None:
-        """A failing TTS engine unblocks verbose waiters via the counter."""
+        """A failing TTS engine unblocks verbose waiters via the item record."""
 
         async def scenario() -> None:
-            text_queue: asyncio.Queue[tuple[str, str, float]] = asyncio.Queue()
+            text_queue: asyncio.Queue[tuple[str, str, float, Any]] = asyncio.Queue()
             audio_queue: queue.Queue[Any] = queue.Queue()
             api_module._text_queue = text_queue
             api_module._audio_queue = audio_queue
+            item = api_module._ItemRecord(asyncio.get_running_loop())
             with patch(
                 "ocr_tts.api.get_or_create_tts", side_effect=RuntimeError("no model")
             ):
                 task = asyncio.create_task(api_module._queue_processor_loop())
-                await text_queue.put(("hi", "voice", 1.0))
-                await self._wait_until(lambda: api_module._processed_count >= 1)
+                await text_queue.put(("hi", "voice", 1.0, item))
+                await self._wait_until(lambda: item.processed.is_set())
                 task.cancel()
                 with pytest.raises(asyncio.CancelledError):
                     await task
@@ -386,15 +389,16 @@ class TestQueueProcessorEdgePaths:
                 super().put_nowait(item)
 
         async def scenario() -> None:
-            text_queue: asyncio.Queue[tuple[str, str, float]] = asyncio.Queue()
+            text_queue: asyncio.Queue[tuple[str, str, float, Any]] = asyncio.Queue()
             audio_queue: FailingSentinelQueue = FailingSentinelQueue()
             api_module._text_queue = text_queue
             api_module._audio_queue = audio_queue
             tts = MagicMock()
             tts.synthesize.return_value = iter([make_chunk()])
+            item = api_module._ItemRecord(asyncio.get_running_loop())
             with patch("ocr_tts.api.get_or_create_tts", return_value=tts):
                 task = asyncio.create_task(api_module._queue_processor_loop())
-                await text_queue.put(("hi", "voice", 1.0))
+                await text_queue.put(("hi", "voice", 1.0, item))
                 await self._wait_until(lambda: audio_queue.qsize() >= 1)
                 task.cancel()
                 with pytest.raises(asyncio.CancelledError):
@@ -456,6 +460,38 @@ class TestDownloadEndpoint:
             gate.set()
             holder.join(timeout=1.0)
 
+    @patch("ocr_tts.api.ensure_voice")
+    def test_download_voice_error_maps_to_502(
+        self, mock_ensure: MagicMock, client: TestClient
+    ) -> None:
+        """A library-level voice download failure yields HTTP 502."""
+        mock_ensure.side_effect = VoiceDownloadError("network down")
+        response = client.post("/download", json={"voice": "en_US-lessac-medium"})
+        assert response.status_code == 502
+        assert "Download failed" in response.text
+        assert not api_module._playback_shutdown.is_set()
+
+
+class TestParseServerArgs:
+    """Tests for ``python -m ocr_tts.api`` argument parsing."""
+
+    def test_defaults(self) -> None:
+        """No arguments yields the default host:port."""
+        assert api_module._parse_server_args([]) == ("127.0.0.1", 8000)
+
+    def test_explicit_host_and_port(self) -> None:
+        """A custom host and port are parsed and returned."""
+        assert api_module._parse_server_args(
+            ["--host", "127.0.0.1", "--port", "9000"]
+        ) == ("127.0.0.1", 9000)
+
+    def test_port_only(self) -> None:
+        """A custom port with the default host."""
+        assert api_module._parse_server_args(["--port", "9000"]) == (
+            "127.0.0.1",
+            9000,
+        )
+
 
 class TestSynthesizeStreamWorkerError:
     """Tests for stream synthesis when the engine fails."""
@@ -477,19 +513,42 @@ class TestSynthesizeStreamWorkerError:
         assert response.content == b""
 
 
-class TestWaitForFirstAudio:
+class TestWaitForItem:
     """Tests for the verbose queue wait helper."""
 
     def test_processed_path(self) -> None:
-        """A completed item returns 'processed' immediately."""
-        api_module._processed_count = 3
-        result = asyncio.run(api_module._wait_for_first_audio_or_processed(1, 1.0))
-        assert result == "processed"
+        """A completed item returns (sets its processed event) immediately."""
+
+        async def scenario() -> None:
+            item = api_module._ItemRecord(asyncio.get_running_loop())
+            item.set_processed()
+            await api_module._wait_for_item(item, timeout=1.0)
+
+        asyncio.run(scenario())
+
+    def test_first_audio_path(self) -> None:
+        """A played item returns as soon as its first audio fires."""
+        loop = asyncio.new_event_loop()
+        try:
+            item = api_module._ItemRecord(loop)
+            item.synthesis_s = 0.5
+            loop.call_soon(item.set_first_audio)
+            loop.run_until_complete(api_module._wait_for_item(item, timeout=1.0))
+        finally:
+            loop.close()
 
     def test_timeout_path(self) -> None:
-        """No progress within the timeout returns 'timeout'."""
-        result = asyncio.run(api_module._wait_for_first_audio_or_processed(99, 0.05))
-        assert result == "timeout"
+        """No progress within the timeout returns without raising.
+
+        The helper cancels its internal waiters so nothing is left pending.
+        """
+        item = api_module._ItemRecord(asyncio.new_event_loop())
+        loop = asyncio.new_event_loop()
+        try:
+            item = api_module._ItemRecord(loop)
+            loop.run_until_complete(api_module._wait_for_item(item, timeout=0.05))
+        finally:
+            loop.close()
 
 
 class TestQueueStreamEndpoint:
@@ -545,7 +604,9 @@ class TestShutdownDrainsQueues:
         audio_queue = api_module._audio_queue
         assert text_queue is not None
         assert audio_queue is not None
-        text_queue.put_nowait(("more", "voice", 1.0))
+        text_queue.put_nowait(
+            ("more", "voice", 1.0, api_module._ItemRecord(asyncio.new_event_loop()))
+        )
         audio_queue.put(make_chunk())
 
         with patch("ocr_tts.api._request_server_exit"):
@@ -573,3 +634,151 @@ class TestServe:
         mock_config.assert_called_once_with(app, host="127.0.0.1", port=8123)
         mock_server_cls.assert_called_once_with(mock_config.return_value)
         server.run.assert_called_once()
+
+
+class TestPerItemRecords:
+    """Tests for per-item latency records (M2)."""
+
+    def test_item_records_keep_independent_latency(self) -> None:
+        """Each item record carries its own latency, not a shared counter."""
+        tts = MagicMock()
+        tts.synthesize.return_value = iter([make_chunk(), make_chunk()])
+        audio_queue: queue.Queue[Any] = queue.Queue()
+
+        async def scenario() -> tuple[Any, Any]:
+            loop = asyncio.get_running_loop()
+            item_a = api_module._ItemRecord(loop)
+            item_b = api_module._ItemRecord(loop)
+            await loop.run_in_executor(
+                None,
+                api_module._synthesize_item,
+                tts,
+                "first",
+                1.0,
+                0,
+                audio_queue,
+                item_a,
+            )
+            await loop.run_in_executor(
+                None,
+                api_module._synthesize_item,
+                tts,
+                "second",
+                1.0,
+                0,
+                audio_queue,
+                item_b,
+            )
+            # Flush the call_soon_threadsafe processed events onto this loop.
+            await asyncio.sleep(0)
+            return item_a, item_b
+
+        item_a, item_b = asyncio.run(scenario())
+        # Both records synthesized independently and both finished.
+        assert item_a.synthesis_s is not None
+        assert item_b.synthesis_s is not None
+        assert item_a.processed.is_set()
+        assert item_b.processed.is_set()
+
+    def test_log_first_audio_latency_publishes_to_current_item(self) -> None:
+        """The playback thread's latency lands on the current item's record."""
+        loop = asyncio.new_event_loop()
+        try:
+            item = api_module._ItemRecord(loop)
+            api_module._current_item = item
+            api_module._synthesis_start_time = time.time() - 0.25
+            api_module._log_first_audio_latency()
+            # Flush the scheduled first_audio event onto the loop.
+            loop.run_until_complete(asyncio.sleep(0))
+        finally:
+            loop.close()
+        assert item.piper_latency_s is not None
+        assert item.first_audio.is_set()
+        # The clock is consumed.
+        assert api_module._synthesis_start_time is None
+
+    def test_two_verbose_requests_report_their_own_latency(self) -> None:
+        """Interleaved verbose requests get their own, per-item latency (M2).
+
+        Enqueues two items through the real endpoint and verifies that each
+        response reports the latency for *its own* item, not the shared
+        last-value counter a subsequent item would have overwritten.
+        """
+        api_module._playback_sink = FakeSink()
+        tts = MagicMock()
+        tts.sample_rate = 22050
+        # A fresh iterator per synthesis call (a shared one-shot iterator
+        # would be exhausted after the first item).
+        tts.synthesize.return_value = iter([make_chunk()])
+        with (
+            patch("ocr_tts.api.get_or_create_tts", return_value=tts),
+            TestClient(app) as client,
+        ):
+            first = client.post(
+                "/queue",
+                json={"text": "first", "wait": True},
+            )
+            tts.synthesize.return_value = iter([make_chunk()])
+            second = client.post(
+                "/queue",
+                json={"text": "second", "wait": True},
+            )
+
+        assert first.status_code == 200
+        assert second.status_code == 200
+        first_data = first.json()
+        second_data = second.json()
+        # Both verbose requests report their own latency and synthesis time.
+        assert first_data["latency_ms"] is not None
+        assert second_data["latency_ms"] is not None
+        assert first_data["synthesis_ms"] is not None
+        assert second_data["synthesis_ms"] is not None
+
+
+class TestStopQueueProcessorJoinsExecutor:
+    """Tests for the cancellation/join behavior of _stop_queue_processor."""
+
+    def test_stop_joins_inflight_executor_future(self) -> None:
+        """After cancelling the task, _stop_queue_processor joins the worker."""
+        started = threading.Event()
+        release = threading.Event()
+
+        def worker() -> None:
+            started.set()
+            release.wait(timeout=5.0)
+
+        async def scenario() -> None:
+            loop = asyncio.get_running_loop()
+            fut = loop.run_in_executor(None, worker)
+            await asyncio.get_running_loop().run_in_executor(None, started.wait)
+            api_module._current_executor_task = fut
+            task = asyncio.create_task(asyncio.sleep(100))
+            api_module._queue_processor_task = task
+
+            stop_task = asyncio.create_task(api_module._stop_queue_processor())
+            # Let the stop helper begin cancelling/joining; it should be
+            # blocked waiting on the in-flight executor future.
+            await asyncio.sleep(0.1)
+            assert not stop_task.done()
+            # Releasing the worker lets the join complete.
+            release.set()
+            await asyncio.wait_for(stop_task, timeout=2.0)
+            assert fut.done()
+            assert api_module._current_executor_task is None
+
+        asyncio.run(scenario())
+
+    def test_stop_logs_cancellation_and_clears_task(self, caplog: Any) -> None:
+        """Cancellation is logged and the task reference is cleared."""
+
+        async def scenario() -> bool:
+            task = asyncio.create_task(asyncio.sleep(100))
+            api_module._queue_processor_task = task
+            with caplog.at_level(logging.INFO, logger="ocr_tts.api"):
+                await api_module._stop_queue_processor()
+            return task.done()
+
+        done = asyncio.run(scenario())
+        assert done
+        assert api_module._queue_processor_task is None
+        assert "Cancelling queue processor task" in caplog.text

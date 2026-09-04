@@ -177,7 +177,7 @@ app.add_typer(api_app, name="api")
 
 @api_app.command("launch")
 def launch(
-    host: str = typer.Option("0.0.0.0", "--host", help="Bind address"),  # noqa: S104
+    host: str = typer.Option("127.0.0.1", "--host", help="Bind address"),
     port: int = typer.Option(8000, "--port", help="Listen port"),
 ) -> None:
     """Run the API server with uvicorn."""

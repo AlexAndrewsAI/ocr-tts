@@ -24,7 +24,8 @@ OCR and TTS toolkit for screen region text extraction.
 
 - Python 3.10 or higher
 - [uv](https://github.com/astral-sh/uv) package manager
-- [Tesseract OCR](https://github.com/tesseract-ocr/tesseract) installed on your system
+- [Tesseract OCR](https://github.com/tesseract-ocr/tesseract)
+  installed on your system
 - [PortAudio](http://www.portaudio.com/) (for sounddevice playback)
 
 ### Installing Tesseract
@@ -260,7 +261,8 @@ from the shell:
 # Queue spoken text (equivalent to `api send-text`)
 scripts/ocr-region.sh speak "Hello world" --voice male --speed 1.3
 
-# Queue text that was OCR'd from a screen selection (equivalent to `api send-region`)
+# Queue text that was OCR'd from a screen selection
+# (equivalent to `api send-region`)
 scripts/ocr-region.sh region "extracted text" --voice female
 ```
 
@@ -298,7 +300,43 @@ curl -N http://localhost:8000/queue/stream --output queue.raw
 curl -X POST http://localhost:8000/queue/clear
 ```
 
-See [TEXT2SPEACH.md](TEXT2SPEACH.md) for detailed documentation.
+See [TEXT2SPEECH.md](TEXT2SPEECH.md) for detailed documentation.
+
+### Global Hotkey Watcher
+
+A background service that watches for hotkey presses and dispatches
+OCR-TTS actions (speak-text, clear queue, shutdown, OCR region
+selection, send-region, launch server, or sequences of actions).
+
+```bash
+# Start the hotkey watcher with the bundled example config
+uv run ocr-tts hotkey-watcher start
+
+# Use a custom configuration file
+uv run ocr-tts hotkey-watcher start --config ~/.config/ocr-tts/hotkeys.yaml
+```
+
+The watcher can be configured with a YAML file (see
+[hotkeys.example.yaml](hotkeys.example.yaml) for details):
+
+```yaml
+hotkeys:
+  - hotkey: <ctrl>+<shift>+s
+    action: speak-text
+    text: Hello world!
+    voice: en_US-hfc_male-medium
+    speed: 1.0
+```
+
+The bundled [hotkeys.example.yaml](hotkeys.example.yaml) provides examples for:
+
+- `speak-text` — speak queued text
+- `queue-clear` — wipe the queue and stop playback
+- `shutdown` — tear down the running server and its subprocesses
+- `ocr-region` — select a region, OCR it, and queue the text
+- `send-region` — queue text from a screen selection
+- `launch` — start the API server if not running
+- `sequence` — run a sequence of actions, stopping at the first failure
 
 ## Development
 

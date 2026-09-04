@@ -61,6 +61,9 @@ __all__ = [
 # Maximum time (seconds) to block waiting for queue items / thread exit.
 _POLL_TIMEOUT_S = 0.1
 
+# Time (seconds) to wait for a worker thread to exit during start()/stop().
+_JOIN_TIMEOUT = 30.0
+
 
 class Synthesizer(Protocol):
     """Structural protocol for anything that can synthesize text to audio.
@@ -235,10 +238,26 @@ class StreamingPlayer:
     def start(self) -> None:
         """Start the background synthesis and playback threads.
 
-        Calling this more than once is a no-op.
+        Calling this more than once is a no-op.  If a previous
+        :meth:`stop` could not join a thread (it was still draining the
+        shared queues), start defends against spawning fresh threads on
+        top of the old ones by joining any straggler first; the player
+        stays stopped if one cannot exit.  Any error from a previous run
+        is cleared on restart.
         """
         if self._started:
             return
+        for thread in self._threads:
+            if thread.is_alive():
+                thread.join(timeout=_JOIN_TIMEOUT)
+                if thread.is_alive():
+                    logger.warning(
+                        "Thread '%s' still alive from a previous run; "
+                        "refusing to start the player",
+                        thread.name,
+                    )
+                    return
+        self._error = None
         self._started = True
         synthesis = threading.Thread(
             target=self._synthesis_loop,
@@ -280,17 +299,24 @@ class StreamingPlayer:
         """Stop the player, finishing all queued text before returning.
 
         Graceful shutdown: queued text is fully synthesized and played
-        before the threads exit and the sink is closed.
+        before the threads exit and the sink is closed.  Only when every
+        thread has actually exited is the player marked stopped; if a
+        thread is still draining after the join timeout, the player stays
+        marked as running so a later :meth:`start` cannot spawn duplicate
+        threads alongside the stragglers.
         """
         if not self._started:
             return
         self._text_queue.put(None)
         for thread in self._threads:
             if thread.is_alive():
-                thread.join(timeout=30)
-            if thread.is_alive():
-                logger.warning("Thread '%s' did not stop cleanly", thread.name)
-                self._error = RuntimeError(f"Thread '{thread.name}' did not stop")
+                thread.join(timeout=_JOIN_TIMEOUT)
+        if any(thread.is_alive() for thread in self._threads):
+            logger.warning(
+                "Some player threads did not stop cleanly; "
+                "player remains marked as running"
+            )
+            return
         self.sink.close()
         self._started = False
         logger.info("Streaming player stopped")
@@ -356,7 +382,9 @@ def live(
         1.0,
         "--speed",
         "-s",
-        help="Speech speed multiplier (0.5-2.0)",
+        min=0.1,
+        max=3.0,
+        help="Speech speed multiplier (0.1-3.0, default: 1.0)",
     ),
 ) -> None:
     """Read lines from stdin and speak each one immediately.

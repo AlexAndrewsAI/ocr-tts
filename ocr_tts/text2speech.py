@@ -6,6 +6,7 @@ streaming audio output, and input queueing.
 """
 
 import logging
+import os
 import re
 import wave
 from collections.abc import Iterator
@@ -20,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "PiperTTS",
+    "VoiceDownloadError",
     "app",
     "download_file",
     "ensure_voice",
@@ -70,41 +72,77 @@ PIPER_DOWNLOAD_URL = (
 )
 
 
+class VoiceDownloadError(RuntimeError):
+    """Raised when a voice model or config download fails.
+
+    This is a library-level error: caller layers translate it into the
+    appropriate boundary-specific failure (``typer.Exit`` for the CLI,
+    an ``HTTPException`` for the API server), keeping Typer out of the
+    server / worker-thread code paths.
+    """
+
+
 def download_file(url: str, dest_path: Path) -> None:
-    """Download a file from URL to destination path.
+    """Download a file from URL to destination path atomically.
 
     Only HTTP and HTTPS URL schemes are permitted to prevent
-    local file access or use of unexpected custom schemes.
+    local file access or use of unexpected custom schemes.  The payload is
+    streamed to a temporary file in the destination directory and renamed
+    into place only after a successful, complete download, so an
+    interrupted or truncated download never leaves a corrupt file that is
+    later treated as "already downloaded".
 
     Args:
         url: URL to download from (must use http or https scheme)
         dest_path: Local path to save the file
 
     Raises:
-        typer.Exit: If the URL scheme is not permitted or the
+        VoiceDownloadError: If the URL scheme is not permitted or the
             download fails.
 
     """
+    import tempfile
     import urllib.parse
     import urllib.request
 
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in ("http", "https"):
-        typer.echo(
-            f"Invalid URL scheme '{parsed.scheme}': only http/https allowed",
-            err=True,
-        )
-        raise typer.Exit(code=1) from None
+        raise VoiceDownloadError(
+            f"Invalid URL scheme '{parsed.scheme}': only http/https allowed"
+        ) from None
 
     logger.info("Downloading %s to %s", url, dest_path)
-    typer.echo(f"Downloading {dest_path.name}...", err=True)
-
+    temp_path: Path | None = None
     try:
-        urllib.request.urlretrieve(url, dest_path)  # noqa: S310
-        typer.echo(f"Successfully downloaded {dest_path.name}", err=True)
+        with urllib.request.urlopen(url, timeout=60) as response:  # noqa: S310
+            fd, temp_name = tempfile.mkstemp(
+                prefix=f".{dest_path.name}.", suffix=".part", dir=dest_path.parent
+            )
+            temp_path = Path(temp_name)
+            try:
+                with os.fdopen(fd, "wb") as handle:
+                    while True:
+                        block = response.read(65536)
+                        if not block:
+                            break
+                        handle.write(block)
+            except BaseException:
+                # Clean up the partial temp file on any failure, then re-raise.
+                temp_path.unlink(missing_ok=True)
+                temp_path = None
+                raise
+        if temp_path is None:  # pragma: no cover - defensive; temp is always set
+            raise VoiceDownloadError(
+                f"Error downloading {dest_path.name}: no temp file"
+            )
+        temp_path.replace(dest_path)
+        logger.info("Successfully downloaded %s", dest_path)
+    except VoiceDownloadError:
+        raise
     except Exception as e:
-        typer.echo(f"Error downloading {dest_path.name}: {e}", err=True)
-        raise typer.Exit(code=1) from None
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+        raise VoiceDownloadError(f"Error downloading {dest_path.name}: {e}") from e
 
 
 def get_voice_dir(voice_dir: str | None = None) -> Path:
@@ -260,7 +298,12 @@ class PiperTTS:
             length_scale value (higher = slower, lower = faster).
 
         """
-        return 1.0 / speed if speed > 0 else 1.0
+        if speed <= 0:
+            raise ValueError(
+                f"Speed must be positive (got {speed}); the pydantic model "
+                "enforces ge=0.1, le=3.0."
+            )
+        return 1.0 / speed
 
     @property
     def sample_rate(self) -> int:
@@ -366,7 +409,9 @@ def main(
         1.0,
         "--speed",
         "-s",
-        help="Speech speed multiplier (0.5-2.0)",
+        min=0.1,
+        max=3.0,
+        help="Speech speed multiplier (0.1-3.0, default: 1.0)",
     ),
     version: bool = typer.Option(
         None,
@@ -401,6 +446,10 @@ def main(
         tts.synthesize_to_wav(text, output, speed)
     except typer.Exit:
         raise
+    except VoiceDownloadError as e:
+        typer.echo(f"Error downloading voice '{voice}': {e}", err=True)
+        logger.exception("Failed to download voice")
+        raise typer.Exit(code=1) from None
     except Exception as e:
         typer.echo(f"Error generating speech: {e}", err=True)
         logger.exception("Failed to generate speech")
