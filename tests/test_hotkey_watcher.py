@@ -329,9 +329,7 @@ class TestRunOcrRegion:
         ):
             result = hw.run_ocr_region(item)
         assert result == {"status": "ok", "queue_size": 4}
-        mock_config_cls.assert_called_once_with(
-            lang="fra", tesseract_cmd="tesseract"
-        )
+        mock_config_cls.assert_called_once_with(lang="fra", tesseract_cmd="tesseract")
         mock_send.assert_called_once()
         assert mock_send.call_args.args[0] == "bonjour"
         assert mock_send.call_args.kwargs["host"] == "localhost"
@@ -381,9 +379,7 @@ class TestRunSendRegion:
         assert mock_send.call_args.kwargs["speed"] == 1.5
         assert mock_send.call_args.kwargs["host"] == "localhost"
         assert mock_send.call_args.kwargs["port"] == 9000
-        mock_config_cls.assert_called_once_with(
-            lang="fra", tesseract_cmd="tesseract"
-        )
+        mock_config_cls.assert_called_once_with(lang="fra", tesseract_cmd="tesseract")
         assert mock_extract.call_args.kwargs["config"] is mock_config_cls.return_value
 
     def test_save_image_param_saves_capture(self, speak_item: HotkeyConfigItem) -> None:

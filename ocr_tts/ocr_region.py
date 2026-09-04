@@ -30,6 +30,7 @@ differs from the logical screen (e.g. gamescope Game Mode).
 """
 
 import logging
+import shutil
 import threading
 import time
 from collections.abc import Callable
@@ -38,8 +39,6 @@ from typing import Any, NamedTuple
 import pytesseract
 from PIL import Image
 from pydantic import BaseModel, Field
-
-import shutil
 
 from ocr_tts.desktop import (
     _primary_monitor,
@@ -443,7 +442,8 @@ def extract_text(image: Image.Image, config: OCRConfig | None = None) -> str:
     if tesseract_path is None:
         raise RuntimeError(
             f"tesseract executable '{config.tesseract_cmd}' not found on PATH. "
-            "Install Tesseract (e.g., apt install tesseract-ocr, brew install tesseract) "
+            "Install Tesseract (e.g., apt install tesseract-ocr, "
+            "brew install tesseract) "
             "or specify the correct binary with --tesseract-cmd."
         )
 
