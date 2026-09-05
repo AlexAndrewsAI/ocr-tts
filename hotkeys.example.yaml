@@ -1,0 +1,59 @@
+# OCR-TTS hotkey watcher configuration.
+#
+# Used by `ocr-tts hotkey-watcher start` when no --config is
+# given.  Copy this file (e.g. to ~/.config/ocr-tts/hotkeys.yaml), edit
+# it, and pass it via:
+#
+#   ocr-tts hotkey-watcher start --config ~/.config/ocr-tts/hotkeys.yaml
+#
+# Fields:
+#   hotkey:        pynput GlobalHotKeys combination (e.g. '<ctrl>+<shift>+s')
+#   action:        one of speak-text, queue-clear, shutdown,
+#                  ocr-region, send-region, launch, sequence
+#   actions:       ordered sub-action list for the `sequence` action
+#                  (e.g. [shutdown, launch] restarts the TTS server);
+#                  execution stops at the first step that fails
+#   text:          text spoken by the speak-text action
+#   voice:         Piper voice name or alias (male, female, ...)
+#   speed:         speech speed multiplier (0.1-3.0)
+#   lang:          OCR language code for the region actions
+#   tesseract_cmd: path to the tesseract executable (send-region)
+#   save_image:    optional path to save the captured region image
+#   host/port:     TTS server the actions talk to
+
+hotkeys:
+  - hotkey: <ctrl>+<shift>+s
+    action: speak-text
+    text: Hello from the OCR-TTS hotkey watcher!
+    voice: en_US-hfc_male-medium
+    speed: 1.0
+    host: 127.0.0.1
+    port: 8000
+
+  - hotkey: <ctrl>+<shift>+x
+    action: queue-clear
+    host: 127.0.0.1
+    port: 8000
+
+  - hotkey: <ctrl>+<shift>+q
+    action: shutdown
+    host: 127.0.0.1
+    port: 8000
+
+  - hotkey: <ctrl>+<shift>+o
+    action: send-region
+    voice: female
+    speed: 1.0
+    lang: eng
+    tesseract_cmd: tesseract
+    save_image: null
+    host: 127.0.0.1
+    port: 8000
+
+  - hotkey: <ctrl>+<shift>+r
+    action: sequence
+    actions:
+      - shutdown
+      - launch
+    host: 127.0.0.1
+    port: 8000

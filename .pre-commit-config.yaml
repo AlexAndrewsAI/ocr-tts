@@ -1,0 +1,50 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-yaml
+        name: Check YAML files
+      - id: check-toml
+        name: Check TOML files
+      - id: end-of-file-fixer
+        name: Fix end of files
+      - id: check-added-large-files
+        name: Check for large files
+        args: ['--maxkb=1000']
+      - id: trailing-whitespace
+        name: Trim trailing whitespace
+
+  - repo: local
+    hooks:
+      - id: ruff
+        name: Lint with ruff
+        entry: uv run ruff check . --fix
+        language: system
+        pass_filenames: false
+        always_run: true
+
+      - id: ruff-format
+        name: Format with ruff
+        entry: uv run ruff format .
+        language: system
+        pass_filenames: false
+        always_run: true
+
+      - id: mypy
+        name: Type check with mypy
+        entry: uv run mypy .
+        language: system
+        pass_filenames: false
+        always_run: true
+
+      - id: pymarkdownlnt
+        name: Lint Markdown with pymarkdownlnt
+        entry: uv run pymarkdown -c .pymarkdown.json scan
+        language: system
+        types: [markdown]
+
+      - id: shellcheck
+        name: Lint shell scripts with shellcheck
+        entry: uv run shellcheck
+        language: system
+        files: \.(sh|bash)$

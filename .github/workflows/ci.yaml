@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "latest"
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      - name: Verify lockfile is up to date
+        run: uv lock --check
+
+      - name: Run tests with coverage
+        run: uv run pytest --cov=ocr_tts --cov-report=term-missing --cov-report=xml --cov-fail-under=75
+
+      - name: Run pre-commit hooks
+        run: uv run prek run --all-files
+
+      - name: Security audit with pip-audit
+        run: uv run pip-audit
+
+      - name: Check changelog updated
+        if: github.event_name == 'pull_request'
+        run: |
+          if git diff origin/main...HEAD --name-only | grep -q CHANGELOG.md; then
+            echo "CHANGELOG.md has been updated."
+          else
+            echo "::error::CHANGELOG.md has not been updated for this branch."
+            echo "Please add your changes to CHANGELOG.md under the section '[version] - date - PR' before merging."
+            exit 1
+          fi
